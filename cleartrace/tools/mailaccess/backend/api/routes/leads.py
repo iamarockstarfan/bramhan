@@ -1,0 +1,128 @@
+"""Phase 3A — read-only Lead API over the corpus ``contacts`` projection.
+
+The harvest pipeline is CLI-driven; the corpus ``contacts`` table is its servable
+Lead projection but nothing exposed it over HTTP until now. These routes surface
+the enriched Lead (person fields + deliverability grade) with the lead-gen
+filters marketers expect (seniority band, deliverability grade), backward-
+compatibly: they are additive and read-only, and every row still carries the
+email-only fields existing consumers rely on.
+
+Auth: mounted under ``/api``, so the Phase-2F ``APIKeyMiddleware`` protects it
+(localhost-open in dev, key-enforced off-localhost) with no per-route wiring.
+Per-principal quota is applied explicitly, matching the investigate routes.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from ...config import settings
+from ...core import corpus_store
+from ...core.product_mode import MODE_VALUES, normalize_mode
+from ...core.suppression import SuppressionUnavailable
+from ..security import enforce_quota
+
+router = APIRouter()
+
+_SUPPRESSION_UNAVAILABLE = HTTPException(
+    status_code=503, detail="suppression store unavailable"
+)
+
+
+@router.get("/leads/{domain}")
+async def get_leads(
+    request: Request,
+    domain: str,
+    seniority: str | None = Query(
+        default=None,
+        description="Filter by seniority band (c-level/vp/director/manager/ic).",
+    ),
+    grade: str | None = Query(
+        default=None,
+        description="Filter by deliverability grade (Valid/Risky/Catch-all/Invalid/Unknown).",
+    ),
+    has_person: bool | None = Query(
+        default=None, description="Only leads with (true) / without (false) a resolved name."
+    ),
+    mode: str | None = Query(
+        default=None,
+        description=(
+            "Serving governance mode for eligibility "
+            f"({'/'.join(MODE_VALUES)}). Defaults to the configured product mode."
+        ),
+    ),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """Return the servable Leads harvested for ``domain`` (read-only).
+
+    Data comes from prior harvest runs' corpus projection; this endpoint never
+    triggers collection. Suppressed subjects are excluded at write AND read time
+    (R2); if the suppression store is unavailable the route fails closed (503).
+
+    Brief B — the serving governance mode that decides eligibility is resolved
+    HERE, per request: the ``mode`` query param when supplied, else the configured
+    ``settings.product_mode``. It is validated up front (an invalid mode fails
+    closed with 400) and threaded through ``read_leads`` to the eligibility
+    verdict, so the served eligibility never depends on a harvest ContextVar
+    leaking in from an unrelated run. The stored per-lead ``policy_status`` remains
+    the provenance of the collection lawful basis, so choosing a permissive serving
+    mode can never manufacture one.
+    """
+    enforce_quota(request)
+    serving_mode = mode if mode is not None else settings.product_mode
+    try:
+        normalize_mode(serving_mode)  # fail closed on an invalid mode
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid mode {serving_mode!r}; expected one of {list(MODE_VALUES)}",
+        ) from exc
+    try:
+        return await corpus_store.read_leads(
+            domain,
+            seniority=seniority,
+            grade=grade,
+            has_person=has_person,
+            limit=limit,
+            offset=offset,
+            mode=serving_mode,
+        )
+    except SuppressionUnavailable as exc:
+        raise _SUPPRESSION_UNAVAILABLE from exc
+
+
+@router.get("/leads/{domain}/changes")
+async def get_change_intelligence(request: Request, domain: str) -> dict:
+    """Phase 6F — change signals for a domain from its two most recent crawls.
+
+    Surfaces likely new-hire / departure, title-change, verification-drift and
+    likely-stale signals derived from corpus diffs. Read-only; never triggers
+    collection.
+    """
+    enforce_quota(request)
+    from ...core.change_intelligence import domain_change_report
+
+    try:
+        report = await domain_change_report(domain)
+    except SuppressionUnavailable as exc:
+        raise _SUPPRESSION_UNAVAILABLE from exc
+    return report.to_dict()
+
+
+@router.get("/leads/{domain}/verification-history")
+async def get_verification_history(
+    request: Request,
+    domain: str,
+    email: str | None = Query(default=None, description="Restrict to one address."),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    """Verification-outcome history for a domain (or a single email within it)."""
+    enforce_quota(request)
+    try:
+        history = await corpus_store.read_verification_history(
+            email=email, domain=domain, limit=limit
+        )
+    except SuppressionUnavailable as exc:
+        raise _SUPPRESSION_UNAVAILABLE from exc
+    return {"domain": domain, "email": email, "count": len(history), "history": history}

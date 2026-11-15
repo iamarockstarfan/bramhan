@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import httpx
+
+from .proxy import ProxyConnectionError, proxy_config
+from .rate_limiter import rate_limiter
+from .scrapingant import (
+    ScrapingAntError,
+    ScrapingAntMode,
+    ScrapingAntTransport,
+    scrapingant_config,
+)
+
+logger = logging.getLogger(__name__)
+
+# Process-wide ceiling on concurrent outbound requests, one semaphore per event
+# loop. Bounds total in-flight sockets/DNS lookups across ALL modules so a wide
+# per-module fan-out can't saturate the resolver. See settings.max_concurrent_requests.
+_request_semaphores: dict[int, asyncio.Semaphore] = {}
+
+
+def _get_request_semaphore() -> asyncio.Semaphore | None:
+    from ..config import settings
+
+    limit = int(getattr(settings, "max_concurrent_requests", 0) or 0)
+    if limit <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    sem = _request_semaphores.get(id(loop))
+    if sem is None:
+        sem = asyncio.Semaphore(limit)
+        _request_semaphores[id(loop)] = sem
+    return sem
+
+
+async def _before_request(request: httpx.Request) -> None:
+    """Event hook: enforce per-domain rate limit and rotate UA for Tor."""
+    _github_auth(request)
+    await rate_limiter.acquire(request.url.host)
+    if proxy_config.is_tor:
+        request.headers["user-agent"] = proxy_config.random_ua()
+
+
+def _github_auth(request: httpx.Request) -> None:
+    """GITHUB_TOKEN (optional) on every GitHub API request that has no auth of its own:
+    5,000 requests/hour instead of 60. Only exactly api.github.com; never logged."""
+    if request.url.host != "api.github.com" or "authorization" in request.headers:
+        return
+    from ..config import settings
+
+    token = str(getattr(settings, "github_token", "") or "").strip()
+    if token:
+        request.headers["Authorization"] = f"Bearer {token}"
+        logger.debug("GitHub API request authenticated with GITHUB_TOKEN")
+
+
+def build_client(
+    *,
+    scrapingant_zone: str | None = None,
+    **kwargs: Any,
+) -> _MailAccessClient:
+    """
+    Return a configured AsyncClient with rate limiting and optional proxy.
+
+    All keyword arguments are forwarded to httpx.AsyncClient.
+    Default timeout is 10 s when not specified by the caller.
+
+    When PROXY_ENABLED=true, the proxy URL is applied to all requests.
+    When the proxy is unreachable a ProxyConnectionError is raised with a hint
+    to check PROXY_URL in .env.
+    """
+    if scrapingant_zone is not None:
+        return build_routed_client(scrapingant_zone, **kwargs)
+
+    kwargs.setdefault("timeout", 10.0)
+    event_hooks: dict[str, list[Any]] = {"request": [_before_request]}
+
+    proxy_url = proxy_config.proxy_url()
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+
+    return _MailAccessClient(event_hooks=event_hooks, **kwargs)
+
+
+def build_routed_client(zone: str, **kwargs: Any) -> _RoutedMailAccessClient:
+    """
+    Return a client that can route requests through ScrapingAnt for a zone.
+
+    ScrapingAnt routing is active only when the module-level config and the
+    zone toggle both enable it.  By default (strict_proxy=True), any
+    ScrapingAnt failure raises ProxyConnectionError — set
+    strict_proxy=False to allow silent fallback to direct.
+    """
+    config = kwargs.pop("_scrapingant_config", scrapingant_config)
+    rest_transport = kwargs.pop("_scrapingant_rest_transport", None)
+    proxy_transport = kwargs.pop("_scrapingant_proxy_transport", None)
+    strict_proxy = kwargs.pop("strict_proxy", True)
+    kwargs.setdefault("timeout", 10.0)
+    event_hooks: dict[str, list[Any]] = {"request": [_before_request]}
+
+    proxy_url = proxy_config.proxy_url()
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+
+    return _RoutedMailAccessClient(
+        zone=zone,
+        scrapingant_transport=ScrapingAntTransport(
+            config,
+            rest_transport=rest_transport,
+            proxy_transport=proxy_transport,
+            strict_proxy=strict_proxy,
+        ),
+        event_hooks=event_hooks,
+        **kwargs,
+    )
+
+
+class _MailAccessClient(httpx.AsyncClient):
+    """AsyncClient subclass that converts proxy errors into ProxyConnectionError."""
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        from . import host_politeness
+
+        if not host_politeness.is_active():
+            return await self._send_bounded(request, **kwargs)
+        # UC2: one in-flight request per host for opted-in probing; the host slot is
+        # taken before the global slot so a queued host never idles a global slot.
+        async with host_politeness.host_slot(request.url.host):
+            response = await self._send_bounded(request, **kwargs)
+            wait = (
+                host_politeness.retry_after_seconds(response.headers)
+                if response.status_code == 429
+                else None
+            )
+            if wait is None:
+                return response
+            await response.aclose()
+            await asyncio.sleep(wait)
+            return await self._send_bounded(request, **kwargs)
+
+    async def _send_bounded(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        sem = _get_request_semaphore()
+        try:
+            if sem is not None:
+                async with sem:
+                    return await super().send(request, **kwargs)
+            return await super().send(request, **kwargs)
+        except (httpx.ProxyError, httpx.ConnectError) as exc:
+            if proxy_config.is_enabled:
+                from ..config import settings
+
+                raise ProxyConnectionError(
+                    f"Proxy connection failed ({settings.proxy_url!r}). "
+                    "Check PROXY_URL in your .env file."
+                ) from exc
+            raise
+
+
+class _RoutedMailAccessClient(_MailAccessClient):
+    def __init__(
+        self,
+        *,
+        zone: str,
+        scrapingant_transport: ScrapingAntTransport,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._scrapingant_zone = zone
+        self._scrapingant_transport = scrapingant_transport
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        if self._scrapingant_transport.mode_for(self._scrapingant_zone) is ScrapingAntMode.DISABLED:
+            return await super().send(request, **kwargs)
+        try:
+            return await self._scrapingant_transport.send(request, self._scrapingant_zone)
+        except ScrapingAntError as exc:
+            if self._scrapingant_transport.strict_proxy:
+                from .proxy import ProxyConnectionError
+
+                raise ProxyConnectionError(
+                    f"ScrapingAnt proxy connection failed for zone {self._scrapingant_zone!r} — "
+                    f"request not sent ({exc}). "
+                    "Run without --use-proxies for direct connection, "
+                    "or pass --proxy-fallback-ok to allow direct fallback."
+                ) from exc
+            logger.warning(
+                "[yellow]⚠ ScrapingAnt proxy failed for %s — "
+                "fell back to direct connection[/yellow]",
+                self._scrapingant_zone,
+            )
+            try:
+                return await super().send(request, **kwargs)
+            except (httpx.ProxyError, httpx.ConnectError) as exc:
+                # In permissive mode: swallow network errors from the direct
+                # fallback too.  The caller sees no error and will return
+                # whatever results it got (potentially zero).
+                logger.debug(
+                    "Direct fallback also failed for zone %s: %s",
+                    self._scrapingant_zone,
+                    exc,
+                )
+                raise ScrapingAntError(
+                    f"Both ScrapingAnt and direct connection failed for zone "
+                    f"{self._scrapingant_zone!r}: {exc}"
+                ) from exc

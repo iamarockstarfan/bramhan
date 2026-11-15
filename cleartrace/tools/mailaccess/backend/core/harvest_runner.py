@@ -1,0 +1,3626 @@
+"""Adaptive two-track runner for domain harvest mode."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import inspect
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from ..config import Settings, settings
+from ..modules.base import ModuleResult, ModuleStatus
+from ..modules.code_and_cert_email import CodeAndCertEmailModule
+from ..modules.commoncrawl_email import CommonCrawlEmailModule
+from ..modules.email_search_dork import EmailSearchDorkModule
+from ..modules.employee_name_discovery import EmployeeNameDiscoveryModule
+from ..modules.github_commits import GitHubDomainCommitsModule
+from ..modules.github_org_members import GitHubOrgMembersModule
+from ..modules.hackertarget_hosts import HackerTargetHostsModule
+from ..modules.m365_passive_intel import run_m365_passive_intel
+from ..modules.npm_email import NpmEmailModule
+from ..modules.package_ecosystems import PackageEcosystemsModule
+from ..modules.pattern_and_verify import PatternAndVerifyModule
+from ..modules.pgp_domain_email import PgpDomainEmailModule
+from ..modules.public_forge import PublicForgeModule
+from ..modules.public_surface_sweeper import PublicSurfaceSweeper
+from ..modules.pypi_email import PyPIEmailModule
+from ..modules.ripe_stat_asn import RIPEStatASNModule
+from ..modules.shodan_internetdb import ShodanInternetDBModule
+from ..modules.subdomain_intel import SubdomainIntelModule
+from ..modules.syndication_feed_sweeper import SyndicationFeedSweeper
+from ..modules.wayback import WaybackDomainHarvestModule
+from ..modules.wordpress_rest import WordPressRestModule
+from .concurrent_fetch_cache import CachedFetch, ConcurrentFetchCache
+from .context_router import IndustryVocabularyRouter
+from .email_extraction import extract_emails
+from .hard_deadline import CANCEL_GRACE_SECONDS, wait_hard
+from .mail_provider import detect_provider_from_mx
+from .mx_resolver import resolve_mx
+from .name_quality import _NAVIGATION_TOKENS, COMMON_ENGLISH_NOUNS, _clean_token
+from .pagination_handler import PaginationHandler
+from .pattern_candidate import PatternRunState
+from .product_mode import get_active_mode
+from .signal_pool import AsyncSignalPool
+from .stealth_client import StealthSession, resolve_timing_profile
+from .structured_data_extractor import extract_people
+from .time_budget import TimeBudget, budget_for_profile
+from .work_scheduler import (
+    PRIORITY_ARCHIVE,
+    PRIORITY_GUARANTEED,
+    PRIORITY_HIGH_SIGNAL,
+    PRIORITY_REGISTRY,
+    PRIORITY_ROUTER_EXPANSION,
+    PRIORITY_SEARCH,
+    PRIORITY_UNIVERSAL,
+    TRACK_GUARANTEED,
+    TRACK_OPPORTUNISTIC,
+    WorkItem,
+    WorkResult,
+    WorkScheduler,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _m365_context_infrastructure(context: Any | None) -> dict[str, Any] | None:
+    """Serialize startup M365 context for exports and timeout summaries."""
+    if context is None:
+        return None
+    if hasattr(context, "to_infrastructure_dict"):
+        return dict(context.to_infrastructure_dict())
+    source = getattr(context, "context", context)
+    return {
+        "is_cloud": getattr(source, "is_cloud", None),
+        "tenant_id": getattr(source, "tenant_id", None),
+        "tenant_type": getattr(source, "tenant_type", None),
+        "adfs_url": getattr(source, "adfs_url", None),
+        "federation_brand": getattr(source, "federation_brand", None),
+        "skipped_cloud_checks": bool(getattr(source, "skipped_cloud_checks", False)),
+        "openid_status": getattr(source, "openid_status", None),
+        "realm_status": getattr(source, "realm_status", None),
+        "onedrive": [],
+    }
+
+def _smtp_rcpt_used(smtp_validation: dict[str, Any] | None) -> bool:
+    """Was the email verification method an actual SMTP RCPT probe?
+
+    Minor fast-follow (Output-Trust final): ``smtp_verification_used`` must be
+    METHOD-accurate, not enablement-accurate. The verification tail routes M365 /
+    Google / Zoho / Proton / Fastmail domains to provider- or Gravatar-based
+    verifiers (no SMTP RCPT); only the fallback SMTP path runs an
+    :class:`SMTPVerifier` batch and stamps ``probes_attempted`` on its summary. So a
+    run against an M365 tenant must NOT report ``smtp_verification_used: true`` just
+    because SMTP was enabled — it wasn't the method used. Mirrors RC7's
+    ``smtp_probes_used > 0`` gate on the orchestrator path.
+    """
+    return int((smtp_validation or {}).get("probes_attempted", 0) or 0) > 0
+
+
+SUBDOMAIN_INTEL_HARD_CAP_FRACTION = 0.30
+# Default only; each harvest computes and stores its profile-specific value on
+# WorkerContext at the start of run_adaptive_harvest().
+SUBDOMAIN_INTEL_HARD_CAP = budget_for_profile("t2") * SUBDOMAIN_INTEL_HARD_CAP_FRACTION
+
+
+def subdomain_intel_hard_cap_for_profile(profile: str) -> float:
+    """Return the hard wall for subdomain_intel for a timing profile."""
+    return budget_for_profile(profile) * SUBDOMAIN_INTEL_HARD_CAP_FRACTION
+
+MODULE_COMMONCRAWL = "commoncrawl_email"
+MODULE_WAYBACK_DOMAIN = "wayback_domain_harvest"
+MODULE_CODE_CERT = "code_and_cert_email"
+MODULE_EMAIL_DORK = "email_search_dork"
+MODULE_NPM_EMAIL = "npm_email"
+MODULE_PYPI_EMAIL = "pypi_email"
+MODULE_PUBLIC_SURFACE = "public_surface_sweeper"
+MODULE_PUBLIC_FORGE = "public_forge"
+MODULE_PACKAGE_ECOSYSTEMS = "package_ecosystems"
+MODULE_SUBDOMAIN_INTEL = "subdomain_intel"
+# Compatibility alias for callers that used the pre-intelligence module name.
+MODULE_SUBDOMAIN_SURFACE = MODULE_SUBDOMAIN_INTEL
+MODULE_PGP_DOMAIN_EMAIL = "pgp_domain_email"
+MODULE_GITHUB_ORG_MEMBERS = "github_org_members"
+MODULE_GITHUB_DOMAIN_COMMITS = "github_domain_commits"
+MODULE_EMPLOYEE_NAMES = "employee_name_discovery"
+MODULE_PATTERN_VERIFY = "pattern_and_verify"
+# Upper bound pattern_and_verify will wait for employee_name_discovery's C1→C2
+# handoff before proceeding without it. Generous (names discovery is normally fast)
+# but finite so a stuck employee run can never deadlock pattern.
+_EMPLOYEE_READY_TIMEOUT = 60.0
+MODULE_PERSON_EMAIL_PIVOT = "person_email_pivot"
+MODULE_PERSONA_EMAIL_PIVOT = "persona_email_pivot"
+MODULE_EMAIL_IDENTITY_ENRICHMENT = "email_identity_enrichment"
+MODULE_WORDPRESS_REST = "wordpress_rest"
+MODULE_SYNDICATION_FEED_SWEEPER = "syndication_feed_sweeper"
+MODULE_HUNTER = "hunter"
+# F2 — Netlas WHOIS contact emails; inline source, scheduled only when Netlas is on.
+MODULE_NETLAS_WHOIS = "netlas_whois_emails"
+# F3 — Netlas certificate emails + SANs; inline source, Netlas-on only.
+MODULE_NETLAS_CERT = "netlas_cert"
+# WhoisFreaks — historical WHOIS contacts of the target; inline source, scheduled
+# only when WhoisFreaks is active or has cached answers for the domain.
+MODULE_WHOISFREAKS_HISTORY = "whoisfreaks_history"
+# F4 — Netlas indexed HTTP responses + FTP banners; inline source, Netlas-on only.
+MODULE_NETLAS_RESPONSES = "netlas_responses"
+# MailAccess Index (our own index of the public web); inline source, runs FIRST
+# and only when MAILACCESS_INDEX_URL + MA_INDEX_SERVICE_KEY are set.
+MODULE_OWN_INDEX = "own_index"
+MODULE_HACKERTARGET = "hackertarget_hosts"
+MODULE_RIPE_STAT_ASN = "ripe_stat_asn"
+MODULE_SHODAN_INTERNETDB = "shodan_internetdb"
+# The provider/validation tail is deliberately short: discovery owns the
+# profile budget, while the tail must not turn a 600-second harvest into a
+# second long-running phase.  Enrichment is dropped when this window closes.
+VERIFICATION_TAIL_SECONDS = 15.0
+# After the discovery deadline, the remaining wrap-up steps (signal-pool flush,
+# breach / waterfall enrichment, grading, technographics) share this budget. Any
+# step still running when it is spent is abandoned, so a timed-out harvest
+# returns within ``timeout + VERIFICATION_TAIL_SECONDS + POST_TIMEOUT_BUDGET``.
+POST_TIMEOUT_BUDGET_SECONDS = 20.0
+
+# Seed dispatch priorities for the discovery scheduler. Insertion order is the
+# submission order; the scheduler pulls lower numbers first. Kept at module
+# scope so priority regressions can be asserted directly in tests.
+_MODULE_PRIORITIES: dict[str, int] = {
+    MODULE_COMMONCRAWL: PRIORITY_ARCHIVE,
+    MODULE_WAYBACK_DOMAIN: PRIORITY_ARCHIVE,
+    MODULE_CODE_CERT: PRIORITY_HIGH_SIGNAL,
+    # 0.13.3: promoted from PRIORITY_SEARCH (40) so on-domain email snippet
+    # discovery competes alongside code_and_cert_email and the GitHub modules
+    # instead of after the archive crawlers and 11 other higher-priority seeds.
+    MODULE_EMAIL_DORK: PRIORITY_HIGH_SIGNAL,
+    MODULE_NPM_EMAIL: PRIORITY_HIGH_SIGNAL,
+    MODULE_PYPI_EMAIL: PRIORITY_HIGH_SIGNAL,
+    MODULE_PUBLIC_SURFACE: PRIORITY_GUARANTEED,
+    MODULE_SUBDOMAIN_SURFACE: PRIORITY_HIGH_SIGNAL,
+    MODULE_HACKERTARGET: PRIORITY_HIGH_SIGNAL,
+    MODULE_PUBLIC_FORGE: PRIORITY_HIGH_SIGNAL,
+    MODULE_PACKAGE_ECOSYSTEMS: PRIORITY_HIGH_SIGNAL,
+    MODULE_PGP_DOMAIN_EMAIL: PRIORITY_HIGH_SIGNAL,
+    MODULE_GITHUB_ORG_MEMBERS: PRIORITY_HIGH_SIGNAL,
+    MODULE_GITHUB_DOMAIN_COMMITS: PRIORITY_HIGH_SIGNAL,
+    MODULE_EMPLOYEE_NAMES: PRIORITY_UNIVERSAL,
+    MODULE_WORDPRESS_REST: PRIORITY_HIGH_SIGNAL,
+    MODULE_SYNDICATION_FEED_SWEEPER: PRIORITY_UNIVERSAL,
+    # Phase 3: pattern_and_verify is always seeded so it appears in
+    # module_results even when no employee names are found (the mock-based
+    # test path). In real harvests it also fires via signal emission.
+    MODULE_PATTERN_VERIFY: PRIORITY_UNIVERSAL,
+}
+def _seed_priorities(cc_first: bool) -> dict[str, int]:
+    """Return the seed priority map, adjusted for the Phase 5B CC-first posture.
+
+    When ``cc_first`` (default), the already-crawled web (Common Crawl + Wayback)
+    is preferred over live search scraping: the archive sources are promoted to
+    the guaranteed tier and the live-search dork drops back to the search tier as
+    the fallback. This is the biggest block-reduction lever at volume — it avoids
+    hitting the DDG/Bing 202/CAPTCHA walls for domains the archive already covers.
+    """
+    prios = dict(_MODULE_PRIORITIES)
+    if cc_first:
+        prios[MODULE_COMMONCRAWL] = PRIORITY_GUARANTEED
+        prios[MODULE_WAYBACK_DOMAIN] = PRIORITY_GUARANTEED
+        # Undo the 0.13.3 promotion of the live-search dork so it runs AFTER the
+        # archive sources (fallback), not alongside the high-signal seeds.
+        prios[MODULE_EMAIL_DORK] = PRIORITY_SEARCH
+    return prios
+
+
+_PERSON_PIVOT_MODULES = frozenset(
+    {
+        MODULE_EMPLOYEE_NAMES,
+        MODULE_PATTERN_VERIFY,
+        MODULE_PERSON_EMAIL_PIVOT,
+        MODULE_EMAIL_IDENTITY_ENRICHMENT,
+        "name_to_github_profile",
+    }
+)
+_ACCUMULATING_MODULES = frozenset(
+    {
+        MODULE_PERSON_EMAIL_PIVOT,
+        MODULE_PERSONA_EMAIL_PIVOT,
+        MODULE_EMAIL_IDENTITY_ENRICHMENT,
+        "name_to_github_profile",
+        # Brief A (R2) — the batch pattern module and the reactive per-name workers
+        # BOTH write ``pattern_and_verify`` results: the reactive path appends via
+        # ``_accumulate_pattern_findings`` and the batch module is recorded here.
+        # Without accumulation the batch result REPLACED every reactive finding (or
+        # vice-versa by arrival order), so a confirmation emitted by one producer
+        # could be lost by the other. Merging keeps every producer's findings; the
+        # canonical resolver reconciles their verification so arrival order and the
+        # merge seam no longer decide the outcome.
+        MODULE_PATTERN_VERIFY,
+    }
+)
+_YIELD_PREDICTION_CANDIDATES = frozenset(
+    {
+        MODULE_NPM_EMAIL,
+        MODULE_PYPI_EMAIL,
+        MODULE_PACKAGE_ECOSYSTEMS,
+        MODULE_PGP_DOMAIN_EMAIL,
+        MODULE_SYNDICATION_FEED_SWEEPER,
+    }
+)
+_PAGE_HEADING_TOKENS = frozenset(
+    {
+        "blue",
+        "convention",
+        "curiosity",
+        "going",
+        "impact",
+        "industry",
+        "key",
+        "over",
+        "team",
+    }
+)
+
+
+@dataclass(frozen=True)
+class WorkerContext:
+    domain: str
+    scheduler: WorkScheduler
+    signal_pool: AsyncSignalPool
+    page_cache: CachedFetch
+    budget: TimeBudget
+    stealth_session: StealthSession
+    settings: Settings
+    enable_smtp: bool = False
+    enable_m365: bool = False
+    enable_yahoo: bool = False
+    use_proxies: bool = False
+    aggressive: bool = False
+    module_results: dict[str, ModuleResult] | None = None
+    on_module_complete: Any | None = None
+    module_overrides: dict[str, Any] | None = None
+    dork_lite_mode: bool | None = None
+    cc_max_records: int | None = None
+    cc_max_collections: int | None = None
+    proxy_fallback_ok: bool = False
+    skip_modules: frozenset[str] = frozenset()
+    with_subdomains: bool = False
+    subdomain_deep: bool = False
+    subdomain_calibrate: bool = False
+    # BYOK Netlas, resolved once per run from ``netlas_client.netlas_active``.
+    netlas_enabled: bool = False
+    # WhoisFreaks (BYOK) — resolved once per run; ``refresh`` is the run's --refresh.
+    whoisfreaks_enabled: bool = False
+    whoisfreaks_refresh: bool = False
+    no_whoisfreaks: bool = False
+    # MailAccess Index — resolved once per run (configured and not --no-own-index).
+    own_index_enabled: bool = False
+    context_vertical: tuple[str, ...] = ()
+    progress_callback: Any | None = None
+    log_callback: Any | None = None
+    provider_detection: Any | None = None
+    provider_mx_records: list[Any] | None = None
+    provider_detection_ready: asyncio.Event | None = None
+    # Signalled when employee_name_discovery reaches a terminal state, so
+    # pattern_and_verify waits for the C1→C2 name handoff instead of racing ahead
+    # of it (it only ever waited on provider detection, which the injected-mock and
+    # cache-hit paths pre-set — letting pattern read an empty employee result).
+    employee_names_ready: asyncio.Event | None = None
+    subdomain_source_telemetry: dict[str, dict[str, Any]] | None = None
+    subdomain_intel_hard_cap: float = SUBDOMAIN_INTEL_HARD_CAP
+    m365_context: Any | None = None
+    # 0.16.0 fix-pass Root A — the ONE shared governed-pattern run-state, common to
+    # the reactive worker and the batch module: tombstones (a dropped mailbox is
+    # never regenerated), per-person emission (finalize reconciliation), and the
+    # shared M365 oracle verification budget. ``default_factory`` gives each harvest
+    # its own instance even though the context is frozen.
+    pattern_run_state: PatternRunState = field(default_factory=PatternRunState)
+    # Per-run Netlas shared state — e.g. the ONE certificate fetch (F3) that
+    # both ``netlas_cert`` and ``subdomain_intel`` consume.
+    netlas_state: dict[str, Any] = field(default_factory=dict)
+    # Modules in flight right now: name -> (module instance, perf_counter start).
+    # Read at the harvest deadline to report (and abandon) what was still running.
+    running_modules: dict[str, Any] = field(default_factory=dict)
+    # Emails the MailAccess Index returned this run (0 = none / error / off).
+    own_index_hits_box: list[int] = field(default_factory=lambda: [0])
+
+    @property
+    def own_index_hits(self) -> int:
+        return self.own_index_hits_box[0]
+
+    def __post_init__(self) -> None:
+        self.signal_pool.pattern_resolver = self.pattern_run_state.resolver
+
+
+def _is_obvious_non_person_name(name: str) -> bool:
+    """Reject noun/navigation-only labels before invoking NER."""
+    tokens = [_clean_token(token) for token in str(name).split()]
+    return bool(tokens) and all(
+        token in COMMON_ENGLISH_NOUNS
+        or token in _NAVIGATION_TOKENS
+        or token in _PAGE_HEADING_TOKENS
+        for token in tokens
+    )
+
+
+def _derive_harvest_status(ctx: WorkerContext, *, timed_out: bool) -> str:
+    """Classify termination from scheduler state, not wall-clock duration."""
+    if not timed_out:
+        return "terminated_early"
+    return "partial_timeout"
+
+
+def _hydrate_subdomain_source_telemetry(ctx: WorkerContext) -> None:
+    """Copy incremental source telemetry into the exportable module result."""
+    telemetry = ctx.subdomain_source_telemetry or {}
+    result = (ctx.module_results or {}).get(MODULE_SUBDOMAIN_INTEL)
+    if result is None or not telemetry:
+        return
+    metadata = dict(result.metadata or {})
+    metadata["sources"] = {
+        source: dict(details) for source, details in telemetry.items()
+    }
+    healthy = sum(
+        1
+        for source, details in telemetry.items()
+        if source not in ("netlas", "netlas_cert") and details.get("status") == "ok"
+    )
+    metadata.setdefault(
+        "passive_quorum",
+        {
+            "required": 2,
+            "returned_results": healthy,
+            "met": healthy >= 2,
+            "warning": None if healthy >= 2 else "passive enumeration quorum failed",
+        },
+    )
+    result.metadata = metadata
+
+
+def _termination_snapshot(
+    ctx: WorkerContext,
+    cleaned: str,
+    *,
+    started: datetime,
+    started_iso: str,
+    timeout_seconds: float,
+    timed_out: bool,
+    still_running: list[str] | None = None,
+) -> Any:
+    """Snapshot the harvest context exactly as it exists at termination.
+
+    Used by the harvest-termination handler when the run cannot return a
+    result object (stage exception, soft kill). Stages write to the shared
+    context; this function only READS it. It never raises — the export must
+    depend on nothing except the harvest ending.
+    """
+    from .domain_harvest_orchestrator import (
+        DomainHarvestResult,
+        _aggregate,
+        _sort_key,
+    )
+
+    module_results = ctx.module_results or {}
+    _hydrate_subdomain_source_telemetry(ctx)
+    try:
+        unique_emails = _aggregate(
+            cleaned,
+            module_results,
+            signal_pool=None,
+            identity_clusters=[],
+            shadow_profiles_out=[],
+            resolver=ctx.pattern_run_state.resolver,
+        )
+        unique_emails.sort(key=_sort_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Termination snapshot aggregation degraded: %s", exc)
+        unique_emails = []
+    completed = datetime.now(timezone.utc)
+    errors = [
+        f"[{name}] {err}"
+        for name, result in module_results.items()
+        for err in (result.errors or [])
+    ]
+    errors.append("harvest terminated before completion; context snapshot exported")
+    metadata = {
+        "harvest_status": _derive_harvest_status(ctx, timed_out=timed_out),
+        "terminated_early": True,
+        "timed_out": timed_out,
+        "timeout_at_seconds": timeout_seconds,
+        "mode": get_active_mode().value,
+        "budget": ctx.budget.stats,
+    }
+    if still_running is not None:
+        metadata["hard_timeout"] = True
+        metadata["still_running_at_timeout"] = list(still_running)
+    return DomainHarvestResult(
+        domain=cleaned,
+        started_at=started_iso,
+        completed_at=completed.isoformat().replace("+00:00", "Z"),
+        duration_seconds=round((completed - started).total_seconds(), 3),
+        module_results=module_results,
+        unique_emails=unique_emails,
+        total_unique_emails=len(unique_emails),
+        high_confidence_count=sum(
+            1 for e in unique_emails
+            if e.confidence_label in {"CONFIRMED", "HIGH"} and not e.is_role
+        ),
+        likely_confidence_count=sum(
+            1 for e in unique_emails
+            if e.confidence_label == "LIKELY" and not e.is_role
+        ),
+        medium_confidence_count=sum(
+            1 for e in unique_emails
+            if e.confidence_label in {"LIKELY", "MEDIUM"} and not e.is_role
+        ),
+        low_confidence_count=sum(
+            1 for e in unique_emails
+            if e.confidence_label == "LOW" and not e.is_role
+        ),
+        role_account_count=sum(1 for e in unique_emails if e.is_role),
+        personal_email_count=sum(1 for e in unique_emails if not e.is_role),
+        errors=errors,
+        # Terminated before the verification tail ran, so no SMTP RCPT probe
+        # happened — reporting SMTP as used here would be a lie (method-accurate).
+        smtp_verification_used=False,
+        employee_names_processed=len(
+            (
+                module_results.get(MODULE_EMPLOYEE_NAMES).findings
+                if module_results.get(MODULE_EMPLOYEE_NAMES) is not None
+                else []
+            )
+            or []
+        ),
+        fetch_cache_stats=None,
+        metadata=metadata,
+        shadow_profiles=[],
+    )
+
+
+async def run_adaptive_harvest(
+    domain: str,
+    timeout_seconds: float,
+    enable_smtp: bool | None = None,
+    enable_m365: bool = False,
+    enable_yahoo: bool = False,
+    use_proxies: bool = False,
+    aggressive: bool = False,
+    timing_profile: str = "t2",
+    *,
+    module_overrides: dict[str, Any] | None = None,
+    on_module_complete: Any | None = None,
+    dork_lite_mode: bool | None = None,
+    cc_max_records: int | None = None,
+    cc_max_collections: int | None = None,
+    proxy_fallback_ok: bool = False,
+    enable_email_identity_enrichment: bool = True,
+    skip_modules: tuple[str, ...] | list[str] | None = None,
+    with_subdomains: bool = False,
+    subdomain_deep: bool = False,
+    subdomain_calibrate: bool = False,
+    progress_callback: Any | None = None,
+    log_callback: Any | None = None,
+    display_subscriber: Any | None = None,
+    on_harvest_end: Any | None = None,
+    netlas_enabled: bool = False,
+    no_ipgeo: bool = False,
+    ipgeo_refresh: bool = False,
+    whoisfreaks_enabled: bool = False,
+    whoisfreaks_refresh: bool = False,
+    no_whoisfreaks: bool = False,
+    own_index_enabled: bool = False,
+    on_context_ready: Any | None = None,
+) -> Any:
+    """Run one adaptive harvest under a HARD ``timeout_seconds`` deadline.
+
+    ``on_context_ready`` (optional, synchronous) receives a zero-argument
+    callable that returns a snapshot of the run as it stands right now (the
+    finished result once there is one). A caller's watchdog uses it to export
+    partial results if the event loop itself is blocked past the deadline.
+    """
+    from .domain_harvest_orchestrator import (
+        DomainHarvestResult,
+        _aggregate,
+        _sort_key,
+        _validate_domain,
+    )
+
+    cleaned = _validate_domain(domain)
+    if enable_smtp is None:
+        enable_smtp = bool(getattr(settings, "smtp_verify_default", True))
+
+    # M365 GetUserRealm/OpenID are domain-level preflight checks. Run them
+    # before creating the scheduler and budget so they cannot compete with
+    # discovery work or consume the harvest clock.
+    m365_context: Any | None = None
+    if getattr(settings, "enable_m365_passive_intel", False):
+        try:
+            m365_context = await asyncio.wait_for(
+                run_m365_passive_intel(cleaned, []),
+                timeout=20.0,
+            )
+        except asyncio.TimeoutError:
+            logger.info("M365 preflight timed out — skipping")
+            m365_context = None
+        except Exception as exc:  # noqa: BLE001 - optional preflight
+            logger.info("M365 preflight failed: %s", exc)
+            m365_context = None
+
+    started = datetime.now(timezone.utc)
+    started_iso = started.isoformat().replace("+00:00", "Z")
+    scheduler = WorkScheduler()
+    signal_pool = AsyncSignalPool(export_threshold=0.0)
+    signal_pool.set_scheduler(scheduler)
+    # Phase 6C — seed corpus-derived pattern priors into the pool so
+    # pattern_and_verify can nudge its guesses toward provider/industry-calibrated
+    # templates. Guarded, and skipped under module injection (the deterministic
+    # test seam); a no-op on an empty corpus (uniform prior → zero change).
+    if getattr(settings, "enable_corpus_pattern_priors", True) and not module_overrides:
+        try:
+            from .pattern_priors import build_priors_from_corpus
+
+            _priors = await build_priors_from_corpus()
+            if not _priors.is_empty:
+                signal_pool.emit_corpus_pattern_priors(_priors.provider_prior_map())
+        except Exception:
+            logger.debug("corpus pattern prior seeding unavailable", exc_info=True)
+    budget = TimeBudget(timeout_seconds)
+    # subdomain_intel gets a profile-derived hard wall that is independent of
+    # the generic module soft timeout.  Store the computed value on the run
+    # context so concurrent harvests do not share mutable timing state.
+    subdomain_intel_hard_cap = subdomain_intel_hard_cap_for_profile(timing_profile)
+    session = StealthSession(timing_profile=resolve_timing_profile(timing_profile))
+    cache = ConcurrentFetchCache(session)
+    page_cache = CachedFetch(cache)
+    module_results: dict[str, ModuleResult] = {}
+    normalized_skip_modules = {
+        str(name).strip() for name in (skip_modules or ()) if str(name).strip()
+    }
+    if "subdomain_surface" in normalized_skip_modules:
+        normalized_skip_modules.add(MODULE_SUBDOMAIN_INTEL)
+    ctx = WorkerContext(
+        domain=cleaned,
+        scheduler=scheduler,
+        signal_pool=signal_pool,
+        page_cache=page_cache,
+        budget=budget,
+        stealth_session=session,
+        settings=settings,
+        enable_smtp=enable_smtp,
+        enable_m365=enable_m365,
+        enable_yahoo=enable_yahoo,
+        use_proxies=use_proxies,
+        aggressive=aggressive,
+        module_results=module_results,
+        on_module_complete=on_module_complete,
+        module_overrides=module_overrides or {},
+        dork_lite_mode=dork_lite_mode,
+        cc_max_records=cc_max_records,
+        cc_max_collections=cc_max_collections,
+        proxy_fallback_ok=proxy_fallback_ok,
+        skip_modules=frozenset(normalized_skip_modules),
+        with_subdomains=with_subdomains,
+        subdomain_deep=subdomain_deep,
+        subdomain_calibrate=subdomain_calibrate,
+        netlas_enabled=bool(netlas_enabled),
+        whoisfreaks_enabled=bool(whoisfreaks_enabled),
+        whoisfreaks_refresh=bool(whoisfreaks_refresh),
+        no_whoisfreaks=bool(no_whoisfreaks),
+        own_index_enabled=bool(own_index_enabled),
+        progress_callback=progress_callback,
+        log_callback=log_callback,
+        provider_detection_ready=asyncio.Event(),
+        employee_names_ready=asyncio.Event(),
+        subdomain_source_telemetry={},
+        subdomain_intel_hard_cap=subdomain_intel_hard_cap,
+        m365_context=m365_context,
+    )
+    if ctx.module_overrides:
+        ctx.provider_detection_ready.set()
+    # Only wait for the employee handoff when employee_name_discovery will actually
+    # run this configuration; otherwise release the barrier upfront so pattern never
+    # stalls. (Injected-module runs launch only the modules explicitly supplied.)
+    _employee_will_run = MODULE_EMPLOYEE_NAMES not in ctx.skip_modules and (
+        not ctx.module_overrides or MODULE_EMPLOYEE_NAMES in ctx.module_overrides
+    )
+    if not _employee_will_run:
+        ctx.employee_names_ready.set()
+
+    # Preserve a truthful per-run module inventory even when the budget is
+    # exhausted before a queued item starts. A missing key used to look like
+    # a configuration bug and made benchmark comparisons non-deterministic.
+    seeded_module_names = (
+        MODULE_COMMONCRAWL, MODULE_WAYBACK_DOMAIN, MODULE_CODE_CERT,
+        MODULE_EMAIL_DORK, MODULE_NPM_EMAIL, MODULE_PYPI_EMAIL,
+        MODULE_PUBLIC_SURFACE, MODULE_PUBLIC_FORGE, MODULE_PACKAGE_ECOSYSTEMS,
+        MODULE_SUBDOMAIN_SURFACE,
+        MODULE_PGP_DOMAIN_EMAIL, MODULE_GITHUB_ORG_MEMBERS,
+        MODULE_GITHUB_DOMAIN_COMMITS, MODULE_EMPLOYEE_NAMES,
+        MODULE_WORDPRESS_REST, MODULE_SYNDICATION_FEED_SWEEPER,
+        MODULE_PATTERN_VERIFY, "security_txt",
+        MODULE_HACKERTARGET,
+        MODULE_RIPE_STAT_ASN,
+    )
+    for module_name in seeded_module_names:
+        skip_reason = (
+            "runtime_policy" if module_name in ctx.skip_modules else "not_started"
+        )
+        seed_metadata: dict[str, Any] = {"domain": cleaned, "skip_reason": skip_reason}
+        if module_name == MODULE_SUBDOMAIN_INTEL:
+            from ..modules.subdomain_intel import DISCOVERY_SOURCE_NAMES
+
+            seeded_sources = {
+                source: {"status": "not_run", "count": 0}
+                for source in DISCOVERY_SOURCE_NAMES
+            }
+            seed_metadata["sources"] = seeded_sources
+            seed_metadata["passive_phase"] = {
+                "status": "not_started",
+                "termination": "not_started",
+            }
+            if ctx.subdomain_source_telemetry is not None:
+                ctx.subdomain_source_telemetry.update(
+                    {source: dict(details) for source, details in seeded_sources.items()}
+                )
+        module_results[module_name] = ModuleResult(
+            status=ModuleStatus.SKIPPED,
+            metadata=seed_metadata,
+        )
+
+    await _seed_scheduler(ctx)
+
+    from ..modules.name_to_github_profile import _github_name_pivot
+
+    index_names_seen: dict[str, int] = {}
+    signal_pool.register_name_subscriber(_on_name_found)
+    signal_pool.register_name_subscriber(
+        lambda name, source, metadata: _github_name_pivot(
+            name, source, metadata, index_names_seen
+        )
+    )
+    persona_seen: set[str] = set()
+    signal_pool.register_name_subscriber(
+        lambda name, source, metadata: _on_name_found_persona_pivot(
+            name, source, metadata, persona_seen
+        )
+    )
+    if display_subscriber is not None:
+        signal_pool.register_display_subscriber(display_subscriber)
+    if enable_email_identity_enrichment:
+        enrichment_seen: set[str] = set()
+        signal_pool.register_email_subscriber(
+            lambda email, source, metadata: _on_email_found(
+                email, source, metadata, enrichment_seen
+            )
+        )
+
+    # MailAccess Index runs FIRST, before any discovery track starts, so its
+    # emails feed the shared dedup and its yield decides whether the live Common
+    # Crawl module runs at all. Bounded by its own 30 s budget and the harvest's.
+    if ctx.own_index_enabled and MODULE_OWN_INDEX not in ctx.skip_modules:
+        await _run_own_index_first(ctx)
+
+    timed_out = False
+
+    async def _run_smtp_validation_tail() -> dict[str, Any]:
+        """Run the guarded SMTP/provider tail for complete or partial runs."""
+        from .domain_harvest_orchestrator import (
+            _attach_smtp_email_verification,
+            _collect_smtp_findings,
+        )
+
+        if not ctx.enable_smtp or ctx.module_overrides:
+            return {"candidates_routed": 0, "skipped": "smtp_disabled"}
+
+        smtp_candidate_count = len(_collect_smtp_findings(cleaned, module_results))
+        if ctx.log_callback is not None:
+            ctx.log_callback("SMTP", "provider verification started")
+        try:
+            attach_kwargs: dict[str, Any] = {}
+            try:
+                accepted = inspect.signature(_attach_smtp_email_verification).parameters
+            except (TypeError, ValueError):
+                accepted = {}
+            if "provider_detection" in accepted:
+                attach_kwargs["provider_detection"] = ctx.provider_detection
+            if "mx_records" in accepted:
+                attach_kwargs["mx_records"] = ctx.provider_mx_records
+            if "m365_context" in accepted:
+                attach_kwargs["m365_context"] = ctx.m365_context
+            summary = await asyncio.wait_for(
+                _attach_smtp_email_verification(
+                    cleaned,
+                    module_results,
+                    **attach_kwargs,
+                ),
+                timeout=45.0,
+            )
+            if ctx.log_callback is not None:
+                provider = summary.get("provider") or "smtp"
+                routed = int(summary.get("candidates_routed") or 0)
+                ctx.log_callback(
+                    "SMTP",
+                    f"provider verification completed: {provider}, {routed} candidates routed",
+                )
+            return summary
+        except (TimeoutError, asyncio.TimeoutError):
+            for result in module_results.values():
+                for finding in result.findings or []:
+                    metadata = finding.setdefault("metadata", {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                        finding["metadata"] = metadata
+                    native_meta = metadata.get("native_email_validation") or {}
+                    if not isinstance(native_meta, dict):
+                        native_meta = {}
+                    if native_meta.get("status") not in {
+                        "invalid",
+                        "disposable",
+                        "mx_missing",
+                    }:
+                        metadata["smtp_verification_status"] = "verification_timeout"
+            timeout_summary = {
+                "candidates_routed": smtp_candidate_count,
+                "status": "verification_timeout",
+            }
+            if ctx.provider_detection is not None:
+                timeout_summary["provider"] = ctx.provider_detection.provider.value
+            m365_infra = _m365_context_infrastructure(ctx.m365_context)
+            if m365_infra is not None:
+                timeout_summary["infrastructure"] = {"m365_tenant": m365_infra}
+            if ctx.log_callback is not None:
+                ctx.log_callback(
+                    "SMTP",
+                    f"provider verification timed out for {smtp_candidate_count} candidates",
+                )
+            return timeout_summary
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SMTP/provider verification failed: %s", exc)
+            failure_summary = {
+                "candidates_routed": smtp_candidate_count,
+                "status": "verification_failed",
+                "error": str(exc),
+            }
+            if ctx.provider_detection is not None:
+                failure_summary["provider"] = ctx.provider_detection.provider.value
+            m365_infra = _m365_context_infrastructure(ctx.m365_context)
+            if m365_infra is not None:
+                failure_summary["infrastructure"] = {"m365_tenant": m365_infra}
+            if ctx.log_callback is not None:
+                ctx.log_callback("SMTP", "provider verification failed")
+            return failure_summary
+
+    async def _run_verification_tail(
+        identity_clusters: list[Any],
+    ) -> dict[str, Any]:
+        """Run verification, low-email validation, then droppable enrichment.
+
+        This deadline starts when the tail starts, independently of the
+        discovery budget. It is shared by normal and partial harvests.
+        """
+        from .domain_harvest_orchestrator import (
+            _aggregate,
+            _apply_low_email_validation_results,
+            _attach_m365_email_verification,
+            _attach_yahoo_email_verification,
+            _run_low_email_validation,
+            _select_low_email_validation_candidates,
+            _select_verifier_for_provider,
+        )
+
+        tail: dict[str, Any] = {}
+        tail_started = asyncio.get_running_loop().time()
+
+        async def _body() -> None:
+            if not ctx.enable_smtp or ctx.module_overrides:
+                tail["smtp_email_verification"] = {
+                    "candidates_routed": 0,
+                    "skipped": "smtp_disabled",
+                }
+                tail["m365_email_verification"] = {"checked": 0, "status": "m365_disabled"}
+                tail["yahoo_email_verification"] = {"checked": 0, "status": "yahoo_disabled"}
+                tail["low_email_validation"] = {"checked": 0, "status": "disabled"}
+            else:
+                await _ensure_provider_detection(ctx)
+                detection = ctx.provider_detection
+                mx_records = ctx.provider_mx_records
+                tail["smtp_email_verification"] = await _run_smtp_validation_tail()
+                if ctx.enable_m365 and not ctx.module_overrides:
+                    tail["m365_email_verification"] = await _attach_m365_email_verification(
+                        cleaned,
+                        module_results,
+                        provider_detection=detection,
+                        mx_records=mx_records,
+                        m365_context=ctx.m365_context,
+                    )
+                else:
+                    tail["m365_email_verification"] = {"checked": 0, "status": "m365_disabled"}
+                if ctx.enable_yahoo and not ctx.module_overrides:
+                    tail["yahoo_email_verification"] = await _attach_yahoo_email_verification(
+                        cleaned,
+                        module_results,
+                        provider_detection=detection,
+                        mx_records=mx_records,
+                    )
+                else:
+                    tail["yahoo_email_verification"] = {"checked": 0, "status": "yahoo_disabled"}
+
+                provisional = _aggregate(
+                    cleaned,
+                    module_results,
+                    signal_pool=signal_pool,
+                    identity_clusters=identity_clusters,
+                    shadow_profiles_out=[],
+                    resolver=ctx.pattern_run_state.resolver,
+                )
+                if not settings.enable_low_email_validation:
+                    tail["low_email_validation"] = {"checked": 0, "status": "disabled"}
+                else:
+                    candidates = _select_low_email_validation_candidates(
+                        cleaned, module_results, provisional
+                    )
+                    if not candidates:
+                        tail["low_email_validation"] = {"checked": 0, "status": "no_candidates"}
+                    else:
+                        method = _select_verifier_for_provider(
+                            detection.provider if detection is not None else None
+                        )
+                        low = await _run_low_email_validation(
+                            cleaned,
+                            candidates,
+                            method,
+                            provider=detection.provider if detection is not None else None,
+                            mx_records=mx_records,
+                        )
+                        low["provider"] = (
+                            detection.provider.value if detection is not None else "unknown"
+                        )
+                        low["promotion"] = _apply_low_email_validation_results(
+                            candidates, low, provisional
+                        )
+                        tail["low_email_validation"] = low
+
+                if settings.xposed_or_not_enabled and not ctx.module_overrides:
+                    from .domain_harvest_orchestrator import _run_xposed_or_not_validation
+
+                    primary_checked = int(tail["low_email_validation"].get("checked") or 0)
+                    shared_cap = min(25, int(settings.harvest_validation_max_per_run))
+                    xposed_budget = max(0, shared_cap - primary_checked)
+                    xposed_candidates = _select_low_email_validation_candidates(
+                        cleaned,
+                        module_results,
+                        provisional,
+                        max_candidates=xposed_budget,
+                    )
+                    try:
+                        xposed_summary, format_metadata = await _run_xposed_or_not_validation(
+                            cleaned,
+                            xposed_candidates,
+                            max_checks=xposed_budget,
+                            delay_seconds=1.0,
+                        )
+                        tail["low_email_validation"]["xposed_or_not"] = xposed_summary
+                        module_results["xposed_or_not"] = ModuleResult(
+                            status=ModuleStatus.SUCCESS,
+                            findings=[],
+                            metadata=format_metadata,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("XposedOrNot passive validation skipped: %s", exc)
+                        tail["low_email_validation"]["xposed_or_not"] = {
+                            "checked": 0,
+                            "status": "skipped",
+                        }
+
+            # Enrichment is intentionally last and can be dropped when the
+            # dedicated tail budget is consumed by verification.
+            for module_name, module_budget in (
+                (MODULE_RIPE_STAT_ASN, 60.0),
+                (MODULE_SHODAN_INTERNETDB, 45.0),
+            ):
+                if module_name in ctx.skip_modules:
+                    continue
+                remaining = VERIFICATION_TAIL_SECONDS - (
+                    asyncio.get_running_loop().time() - tail_started
+                )
+                if remaining <= 1.0:
+                    tail.setdefault("enrichment", {})[module_name] = "dropped_tail_budget"
+                    continue
+                try:
+                    await _run_module(module_name, ctx, soft_timeout=min(module_budget, remaining))
+                    tail.setdefault("enrichment", {})[module_name] = "completed"
+                except Exception as exc:  # noqa: BLE001
+                    tail.setdefault("enrichment", {})[module_name] = f"failed: {exc}"
+
+            # Shared IP cache reads are unconditional, fresh calls are BYOK.
+            if not ctx.module_overrides and "ip_intel" not in ctx.skip_modules:
+                await enrich_harvest_ip_intel(module_results, no_ipgeo=no_ipgeo,
+                                              refresh=ipgeo_refresh)
+
+            # Enterprise Network Intelligence (Phase 2). Domain-level and
+            # provider-agnostic; runs once per domain in the same enrichment
+            # phase as Shodan / RIPE. Fully budget-capped inside the module and
+            # exception-guarded here so a failure never disturbs the tail.
+            if (
+                not ctx.module_overrides
+                and (settings.enable_ntlm_challenge or settings.enable_lync_discovery)
+                and "enterprise_net_intel" not in ctx.skip_modules
+            ):
+                from .domain_harvest_orchestrator import _attach_enterprise_net_intel
+
+                remaining = VERIFICATION_TAIL_SECONDS - (
+                    asyncio.get_running_loop().time() - tail_started
+                )
+                if remaining <= 1.0:
+                    tail.setdefault("enrichment", {})[
+                        "enterprise_net_intel"
+                    ] = "dropped_tail_budget"
+                else:
+                    try:
+                        await _attach_enterprise_net_intel(cleaned, module_results)
+                        tail.setdefault("enrichment", {})[
+                            "enterprise_net_intel"
+                        ] = "completed"
+                    except Exception as exc:  # noqa: BLE001
+                        tail.setdefault("enrichment", {})[
+                            "enterprise_net_intel"
+                        ] = f"failed: {exc}"
+
+        try:
+            await asyncio.wait_for(_body(), timeout=VERIFICATION_TAIL_SECONDS)
+            tail["tail_status"] = "completed"
+        except (TimeoutError, asyncio.TimeoutError):
+            tail["tail_status"] = "partial_timeout"
+            tail.setdefault("low_email_validation", {"checked": 0, "status": "tail_timeout"})
+            logger.warning(
+                "Verification tail exhausted its dedicated %.0fs budget",
+                VERIFICATION_TAIL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            tail["tail_status"] = "failed"
+            tail["error"] = str(exc)
+            logger.warning("Verification tail failed: %s", exc)
+        return tail
+
+    # ``final_result`` is set by the completion branches below. The
+    # harvest-termination handler (the ``finally`` at the bottom of this
+    # function) exports exactly this object — or a snapshot of the live
+    # context when no result object could be built (stage exception,
+    # soft kill). This outer try is what makes the export reachable from
+    # every termination path.
+    final_result: Any | None = None
+    still_running: list[str] = []
+
+    def _live_snapshot() -> Any:
+        if final_result is not None:
+            return final_result
+        return _termination_snapshot(
+            ctx,
+            cleaned,
+            started=started,
+            started_iso=started_iso,
+            timeout_seconds=timeout_seconds,
+            timed_out=True,
+            still_running=sorted(set(still_running) | set(_running_of(ctx))),
+        )
+
+    if on_context_ready is not None:
+        try:
+            on_context_ready(_live_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("on_context_ready hook failed: %s", exc)
+    try:
+        try:
+            # HARD deadline: at ``timeout_seconds`` everything still running is
+            # cancelled and given a short grace to unwind; anything that ignores
+            # the cancellation (or sits behind an un-cancellable await) is
+            # abandoned rather than waited for. ``asyncio.wait_for`` would wait
+            # for it forever, which is how spryker.com ran 48 minutes past
+            # ``--timeout 300``.
+            tracks_task = asyncio.ensure_future(_run_tracks(ctx))
+            try:
+                done, _ = await asyncio.wait(
+                    {tracks_task}, timeout=max(0.0, budget.remaining())
+                )
+            except asyncio.CancelledError:
+                tracks_task.cancel()
+                raise
+            if tracks_task in done:
+                tracks_task.result()
+            else:
+                timed_out = True
+                budget.mark_exhausted()
+                # Named before the cancel, while they are still in flight.
+                still_running = sorted(_running_of(ctx))
+                logger.info("Budget exhausted - returning partial results")
+                await wait_hard(tracks_task, 0.0, grace=CANCEL_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            if budget.is_expired():
+                timed_out = True
+                budget.mark_exhausted()
+                logger.info("Budget exhausted during track cancellation")
+            else:
+                raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Track failure: %s", exc)
+
+        if timed_out:
+            # Report what the deadline cut off, and keep whatever those modules
+            # streamed before it (partial_findings hook), as a PARTIAL result.
+            stuck = _abandon_running_modules(ctx)
+            still_running = sorted(set(still_running) | set(stuck))
+            if still_running and ctx.log_callback is not None:
+                with contextlib.suppress(Exception):
+                    ctx.log_callback(
+                        "TIMEOUT",
+                        "harvest deadline reached; still running: " + ", ".join(still_running),
+                    )
+
+        # A module can soft-timeout internally while the overall harvest still
+        # completes normally. Preserve incremental source telemetry on that
+        # path too; the export must not depend on the module returning its
+        # end-of-run metadata.
+        _hydrate_subdomain_source_telemetry(ctx)
+
+        if timed_out:
+            # The discovery timeout is a valid partial-result boundary. The
+            # dedicated post-discovery tail still runs before aggregation and
+            # export, using its own deadline; every other wrap-up step shares
+            # POST_TIMEOUT_BUDGET_SECONDS and is abandoned when it is spent.
+            post_deadline = time.monotonic() + POST_TIMEOUT_BUDGET_SECONDS
+
+            def _post_left(cap: float | None = None) -> float:
+                left = max(0.0, post_deadline - time.monotonic())
+                return left if cap is None else min(cap, left)
+
+            post_dropped: list[str] = []
+
+            async def _bounded(label: str, aw: Any, cap: float | None = None) -> tuple[bool, Any]:
+                ok, value = await wait_hard(aw, _post_left(cap), grace=0.5)
+                if not ok:
+                    post_dropped.append(label)
+                    logger.warning("post-timeout step %s dropped at the hard deadline", label)
+                return ok, value
+
+            await _bounded("signal_pool_close", signal_pool.close(), cap=5.0)
+            from .domain_harvest_orchestrator import (
+                DomainHarvestResult,
+                _aggregate,
+                _sort_key,
+            )
+
+            _ok, identity_clusters = await _bounded(
+                "identity_clusters", signal_pool.all_candidates(), cap=5.0
+            )
+            identity_clusters = identity_clusters or []
+            _hydrate_subdomain_source_telemetry(ctx)
+            shadow_profiles: list[dict[str, Any]] = []
+            # The tail has its own VERIFICATION_TAIL_SECONDS deadline; the hard
+            # wrapper only guarantees a stuck step inside it cannot outlive it.
+            async def _tail() -> dict[str, Any]:
+                return await _run_verification_tail(identity_clusters)
+
+            _ok, tail = await wait_hard(_tail(), VERIFICATION_TAIL_SECONDS + 1.0, grace=0.5)
+            tail = tail or {"tail_status": "partial_timeout"}
+            smtp_validation = tail.get("smtp_email_verification", {})
+            unique_emails = _aggregate(
+                cleaned,
+                module_results,
+                signal_pool=signal_pool,
+                identity_clusters=identity_clusters,
+                shadow_profiles_out=shadow_profiles,
+                resolver=ctx.pattern_run_state.resolver,
+            )
+            unique_emails.sort(key=_sort_key)
+            timeout_enrichment: dict[str, Any] | None = None
+            if not ctx.module_overrides:
+                await _bounded(
+                    "breach_enrichment",
+                    _attach_breach_enrichment(unique_emails, module_results, ctx),
+                )
+                # Phase 7A/7B — enrichment waterfall before grading, parity with
+                # the normal path.
+                _ok, timeout_enrichment = await _bounded(
+                    "enrichment_waterfall", _enrich_leads_waterfall(cleaned, unique_emails)
+                )
+                # Phase 3C/3D + 4A — grade + capture on the partial-timeout path
+                # too, so a timed-out bulk domain still contributes calibration
+                # volume and carries deliverability grades (parity with normal).
+                await _bounded(
+                    "grading",
+                    _grade_leads_and_capture(cleaned, unique_emails, module_results),
+                )
+            # Capstone finding — final observed-beats-inferred pass over the complete
+            # set (late soft-timeout completions / enrichment can add observed
+            # addresses after the aggregate).
+            unique_emails = _finalize_person_selection(ctx, unique_emails)
+            _ok, technographics = await _bounded(
+                "technographics", _compute_technographics(ctx, cache)
+            )
+            completed = datetime.now(timezone.utc)
+            errors = [
+                f"[{name}] {err}"
+                for name, result in module_results.items()
+                for err in (result.errors or [])
+            ]
+            errors.append("harvest timed out during discovery; partial result exported")
+            partial_metadata = {
+                "harvest_status": _derive_harvest_status(ctx, timed_out=True),
+                "timed_out": True,
+                "mode": get_active_mode().value,
+                "timeout_at_seconds": timeout_seconds,
+                "budget": budget.stats,
+                "technographics": technographics,
+                "enrichment": timeout_enrichment,
+                "smtp_email_verification": smtp_validation,
+                "m365_email_verification": tail.get("m365_email_verification", {}),
+                "yahoo_email_verification": tail.get("yahoo_email_verification", {}),
+                "low_email_validation": tail.get("low_email_validation", {}),
+                "verification_tail": tail,
+                # Hard-timeout report: which modules the deadline cut off, and
+                # which wrap-up steps were dropped to return on time.
+                "hard_timeout": True,
+                "still_running_at_timeout": still_running,
+                "post_timeout_dropped": post_dropped,
+            }
+            m365_infra = _m365_context_infrastructure(ctx.m365_context)
+            if m365_infra is not None:
+                partial_metadata["m365_tenant"] = m365_infra
+            partial_metadata["signal_pool"] = _signal_pool_stats(signal_pool)
+            final_result = DomainHarvestResult(
+                domain=cleaned,
+                started_at=started_iso,
+                completed_at=completed.isoformat().replace("+00:00", "Z"),
+                duration_seconds=round((completed - started).total_seconds(), 3),
+                module_results=module_results,
+                unique_emails=unique_emails,
+                total_unique_emails=len(unique_emails),
+                high_confidence_count=sum(
+                    1 for e in unique_emails
+                    if e.confidence_label in {"CONFIRMED", "HIGH"} and not e.is_role
+                ),
+                likely_confidence_count=sum(
+                    1 for e in unique_emails
+                    if e.confidence_label == "LIKELY" and not e.is_role
+                ),
+                medium_confidence_count=sum(
+                    1 for e in unique_emails
+                    if e.confidence_label in {"LIKELY", "MEDIUM"} and not e.is_role
+                ),
+                low_confidence_count=sum(
+                    1 for e in unique_emails
+                    if e.confidence_label == "LOW" and not e.is_role
+                ),
+                role_account_count=sum(1 for e in unique_emails if e.is_role),
+                personal_email_count=sum(1 for e in unique_emails if not e.is_role),
+                errors=errors,
+                # Method-accurate: true only if the tail's SMTP path ran an RCPT batch
+                # (M365/Google/etc. provider verification is not SMTP — minor follow-up).
+                smtp_verification_used=_smtp_rcpt_used(smtp_validation),
+                employee_names_processed=len(
+                    (
+                        module_results.get(MODULE_EMPLOYEE_NAMES).findings
+                        if module_results.get(MODULE_EMPLOYEE_NAMES) is not None
+                        else []
+                    )
+                    or []
+                ),
+                fetch_cache_stats=cache.stats(),
+                metadata=partial_metadata,
+                shadow_profiles=shadow_profiles,
+            )
+            return final_result
+
+        # Flush subscriber work before taking the identity-cluster snapshot.
+        closed, _ = await wait_hard(signal_pool.close(), 5.0, grace=0.5)
+        if not closed:
+            logger.warning("Signal-pool shutdown exceeded 5s; continuing with snapshot")
+        from .domain_harvest_orchestrator import _attach_native_email_validation
+        from .historical_diff import annotate_historical_diff
+        historical_metrics = annotate_historical_diff(module_results)
+        identity_clusters = await signal_pool.all_candidates()
+        if ctx.module_overrides:
+            # Injected modules are deterministic unit-test/embedder paths;
+            # do not introduce live DNS into them.
+            native_validation = {
+                "checked": 0,
+                "skipped": "injected_modules",
+            }
+        else:
+            native_validation = await _attach_native_email_validation(
+                cleaned,
+                module_results,
+            )
+        tail = await _run_verification_tail(identity_clusters)
+        smtp_validation = tail.get("smtp_email_verification", {})
+        m365_validation = tail.get("m365_email_verification", {})
+        yahoo_validation = tail.get("yahoo_email_verification", {})
+        shadow_profiles: list[dict[str, Any]] = []
+        unique_emails = _aggregate(
+            cleaned,
+            module_results,
+            signal_pool=signal_pool,
+            identity_clusters=identity_clusters,
+            shadow_profiles_out=shadow_profiles,
+            resolver=ctx.pattern_run_state.resolver,
+        )
+        dns_signals = {"spf_present": False, "dmarc_strict": False}
+        has_pattern_candidates = any(
+            isinstance(finding.get("metadata"), dict)
+            and finding["metadata"].get("pattern_template")
+            for result in module_results.values()
+            for finding in result.findings or []
+        )
+        if has_pattern_candidates and not ctx.module_overrides:
+            from .domain_harvest_orchestrator import (
+                apply_domain_email_dns_signals,
+                resolve_domain_email_dns_signals,
+            )
+
+            dns_signals = await resolve_domain_email_dns_signals(cleaned)
+            apply_domain_email_dns_signals(unique_emails, dns_signals)
+        if not ctx.module_overrides:
+            await _attach_breach_enrichment(unique_emails, module_results, ctx)
+        unique_emails.sort(key=_sort_key)
+        # Phase 3C/3D + 4A — grade every lead from non-SMTP signals and snapshot
+        # its feature vector for calibration. This is invoked on the LIVE adaptive
+        # path (the only path the CLI/API run through), so single-domain AND
+        # Phase-5A bulk harvests populate
+        # deliverability grades and accrue the 4A capture volume the promotion
+        # gate needs — identically, preserving per-domain parity. Additive,
+        # guarded; skipped for injected-module test/embedder paths.
+        enrichment_summary: dict[str, Any] | None = None
+        if not ctx.module_overrides:
+            # Phase 7A/7B — enrichment waterfall runs before grading so graded
+            # fields see any enrichment-filled person/company data.
+            enrichment_summary = await _enrich_leads_waterfall(cleaned, unique_emails)
+            await _grade_leads_and_capture(cleaned, unique_emails, module_results)
+        # Capstone finding — final observed-beats-inferred pass over the COMPLETE set,
+        # after enrichment/grade (which can add a late observed address for a person).
+        unique_emails = _finalize_person_selection(ctx, unique_emails)
+        # Phase 5D — technographic tags from already-fetched bytes (no new I/O).
+        technographics = await _compute_technographics(ctx, cache)
+        low_email_validation = tail.get("low_email_validation", {})
+        completed = datetime.now(timezone.utc)
+        completed_iso = completed.isoformat().replace("+00:00", "Z")
+        duration = (completed - started).total_seconds()
+        high = sum(
+            1
+            for e in unique_emails
+            if e.confidence_label in {"CONFIRMED", "HIGH"} and not e.is_role
+        )
+        likely = sum(
+            1
+            for e in unique_emails
+            if e.confidence_label == "LIKELY" and not e.is_role
+        )
+        # ``medium`` is the historical "anything above LOW" band
+        # (LIKELY + MEDIUM) for backward compatibility with
+        # downstream tooling.
+        medium = sum(
+            1
+            for e in unique_emails
+            if e.confidence_label in {"LIKELY", "MEDIUM"} and not e.is_role
+        )
+        low = sum(
+            1
+            for e in unique_emails
+            if e.confidence_label == "LOW" and not e.is_role
+        )
+        role = sum(1 for e in unique_emails if e.is_role)
+        errors = [
+            f"[{name}] {err}"
+            for name, result in module_results.items()
+            for err in (result.errors or [])
+        ]
+        pattern_meta = module_results.get(
+            MODULE_PATTERN_VERIFY,
+            ModuleResult(status=ModuleStatus.SKIPPED),
+        ).metadata or {}
+        confirmed_patterns = signal_pool.get_confirmed_patterns()
+        metadata = {
+            "harvest_status": "completed",
+            "timed_out": False,
+            # Provenance accuracy — record the ACTUAL run/serving mode (set by
+            # run_domain_harvest via set_active_mode) so the export watermark and the
+            # export-time eligibility reflect the mode the run executed under, not the
+            # security-investigation default.
+            "mode": get_active_mode().value,
+            "budget": budget.stats,
+            "technographics": technographics,
+            "enrichment": enrichment_summary,
+            "identity_clusters": [
+                {
+                    "canonical_key": list(cluster.canonical_key),
+                    "score": cluster.score,
+                    "export_tier": cluster.export_tier,
+                    "boost_flags": sorted(cluster.boost_flags),
+                    "signal_count": len(cluster.signals),
+                }
+                for cluster in identity_clusters
+            ],
+            "historical_diff": historical_metrics,
+            "native_email_validation": native_validation,
+            "smtp_email_verification": smtp_validation,
+            "m365_email_verification": m365_validation,
+            "yahoo_email_verification": yahoo_validation,
+            "low_email_validation": low_email_validation,
+            "verification_tail": tail,
+        }
+        m365_infra = _m365_context_infrastructure(ctx.m365_context)
+        if m365_infra is not None:
+            metadata["m365_tenant"] = m365_infra
+        # Q5/0.3 — surface signal-pool throughput incl. any dropped signals so losses
+        # are visible in the report rather than only logged.
+        metadata["signal_pool"] = _signal_pool_stats(signal_pool)
+        final_result = DomainHarvestResult(
+            domain=cleaned,
+            started_at=started_iso,
+            completed_at=completed_iso,
+            duration_seconds=round(duration, 3),
+            module_results=module_results,
+            unique_emails=unique_emails,
+            total_unique_emails=len(unique_emails),
+            high_confidence_count=high,
+            likely_confidence_count=likely,
+            medium_confidence_count=medium,
+            low_confidence_count=low,
+            role_account_count=role,
+            personal_email_count=len(unique_emails) - role,
+            errors=errors,
+            # Method-accurate: true only when a real SMTP RCPT batch ran — either in
+            # the verification tail or in pattern-and-verify (RC7 gate). M365/Google
+            # provider verification is not SMTP and must not set this.
+            smtp_verification_used=(
+                _smtp_rcpt_used(smtp_validation)
+                or int((pattern_meta or {}).get("smtp_probes_used", 0) or 0) > 0
+            ),
+            catchall_detected=(
+                pattern_meta.get("is_catchall")
+                if pattern_meta.get("is_catchall") is not None
+                else smtp_validation.get("is_catchall")
+            ),
+            confirmed_pattern=pattern_meta.get("confirmed_pattern")
+            or (confirmed_patterns[0] if confirmed_patterns else None),
+            employee_names_processed=_employee_name_count(module_results),
+            fetch_cache_stats=cache.stats(),
+            metadata=metadata,
+            shadow_profiles=shadow_profiles,
+        )
+        return final_result
+    finally:
+        # Bounded: a stuck subscriber or in-flight fetch must not hold the harvest open.
+        with contextlib.suppress(Exception):
+            await wait_hard(signal_pool.close(), 2.0, grace=0.5)
+        with contextlib.suppress(Exception):
+            await wait_hard(cache.aclose(), 2.0, grace=0.5)
+        # A cert fetch still in flight when the harvest ends must not outlive it.
+        _cert_future = ctx.netlas_state.get("certs")
+        if _cert_future is not None and not _cert_future.done():
+            _cert_future.cancel()
+        # --------------------------------------------------------------
+        # Harvest-termination handler — the single unconditional export
+        # trigger. It runs on EVERY exit path (normal completion, budget
+        # timeout, stage exception, soft kill) and exports the harvest
+        # context exactly as it exists at this moment: the finished
+        # result object when one was built, otherwise a snapshot of the
+        # shared in-memory state. Stages write to context; only this
+        # handler emits the harvest-end event the export hangs off of,
+        # so the export depends on nothing except the harvest ending.
+        # No pipeline stage owns, gates, or chains it.
+        #
+        # ``on_harvest_end`` must be a SYNCHRONOUS callable: it may run
+        # while the task is being cancelled, so it must not await.
+        # --------------------------------------------------------------
+        if on_harvest_end is not None:
+            snapshot = final_result
+            if snapshot is None:
+                snapshot = _termination_snapshot(
+                    ctx,
+                    cleaned,
+                    started=started,
+                    started_iso=started_iso,
+                    timeout_seconds=timeout_seconds,
+                    timed_out=timed_out,
+                    still_running=still_running if timed_out else None,
+                )
+            try:
+                on_harvest_end(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Harvest-end export trigger failed: %s", exc)
+
+
+def planned_harvest_modules(
+    skip_modules: frozenset[str] | set[str] | tuple[str, ...] = (),
+    *,
+    netlas: bool = False,
+    whoisfreaks: bool = False,
+    hunter: bool = False,
+    own_index: bool = False,
+) -> list[str]:
+    """The module list a harvest really schedules (same rules as ``_seed_scheduler``),
+    so progress counts match the run instead of a hardcoded list."""
+    skip = set(skip_modules)
+    names = ([MODULE_OWN_INDEX] if own_index else []) + list(_seed_priorities(True))
+    if netlas:
+        names += [MODULE_NETLAS_RESPONSES, MODULE_NETLAS_CERT, MODULE_NETLAS_WHOIS]
+    if whoisfreaks:
+        names.append(MODULE_WHOISFREAKS_HISTORY)
+    if hunter:
+        names.append(MODULE_HUNTER)
+    names.append("security_txt")
+    out: list[str] = []
+    for name in names:
+        if name not in skip and name not in out:
+            out.append(name)
+    return out
+
+
+async def _seed_scheduler(ctx: WorkerContext) -> None:
+    homepage = await _read_homepage_for_router(ctx)
+    router_result = IndustryVocabularyRouter().route(homepage)
+    object.__setattr__(ctx, "context_vertical", tuple(router_result.inferred_industries))
+    for path in router_result.target_paths:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="fetch_page",
+                url=f"https://{ctx.domain}{path}",
+                priority=PRIORITY_GUARANTEED,
+                track=TRACK_GUARANTEED,
+                source="industry_router",
+            )
+        )
+    if not ctx.module_overrides:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="provider_detection",
+                priority=PRIORITY_GUARANTEED,
+                track=TRACK_GUARANTEED,
+                source="mx_provider_detection",
+            )
+        )
+    await ctx.scheduler.submit(
+        WorkItem(
+            kind="fetch_page",
+            url=f"https://{ctx.domain}/",
+            priority=PRIORITY_GUARANTEED,
+            track=TRACK_GUARANTEED,
+            source="homepage",
+        )
+    )
+
+    # Phase 5B — CC-first posture: prefer the already-crawled web (Common Crawl
+    # + Wayback) over live search scraping. Under cc_first the archive sources
+    # join the guaranteed track (run first, reliably) while the live-search dork
+    # drops to the search-tier fallback (see _seed_priorities).
+    cc_first = bool(getattr(ctx.settings, "cc_first", True))
+    guaranteed_modules = {MODULE_PUBLIC_SURFACE, MODULE_HACKERTARGET}
+    if cc_first:
+        guaranteed_modules = guaranteed_modules | {MODULE_COMMONCRAWL, MODULE_WAYBACK_DOMAIN}
+    seeds = tuple(_seed_priorities(cc_first).items())
+    for module_name, priority in seeds:
+        if module_name in ctx.skip_modules:
+            continue
+        seed_track = (
+            TRACK_GUARANTEED
+            if module_name in guaranteed_modules
+            else TRACK_OPPORTUNISTIC
+        )
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=module_name,
+                priority=priority,
+                track=seed_track,
+                source="legacy_module",
+            )
+        )
+    if ctx.netlas_enabled and MODULE_NETLAS_RESPONSES not in ctx.skip_modules:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=MODULE_NETLAS_RESPONSES,
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="response",
+            )
+        )
+    if ctx.netlas_enabled and MODULE_NETLAS_CERT not in ctx.skip_modules:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=MODULE_NETLAS_CERT,
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="cert",
+            )
+        )
+    if ctx.netlas_enabled and MODULE_NETLAS_WHOIS not in ctx.skip_modules:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=MODULE_NETLAS_WHOIS,
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="whois",
+            )
+        )
+    if getattr(ctx, "whoisfreaks_enabled", False) and MODULE_WHOISFREAKS_HISTORY not in ctx.skip_modules:
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=MODULE_WHOISFREAKS_HISTORY,
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="whois_history",
+            )
+        )
+    if getattr(ctx.settings, "hunter_io_api_key", None):
+        await ctx.scheduler.submit(
+            WorkItem(
+                kind="run_module",
+                module_name=MODULE_HUNTER,
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="hunter",
+            )
+        )
+    await ctx.scheduler.submit(
+        WorkItem(
+            kind="run_module",
+            module_name="security_txt",
+            priority=PRIORITY_GUARANTEED,
+            track=TRACK_GUARANTEED,
+            source="seed",
+        )
+    )
+
+
+async def _run_tracks(ctx: WorkerContext) -> None:
+    progress = asyncio.create_task(_progress_loop(ctx))
+    tracks = [
+        asyncio.create_task(_track1_loop(ctx, concurrency=3)),
+        asyncio.create_task(_track2_loop(ctx, concurrency=5)),
+    ]
+    try:
+        outcomes = await asyncio.gather(*tracks, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                logger.error("Harvest track failed: %r", outcome)
+    finally:
+        progress.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await progress
+
+
+async def _track1_loop(ctx: WorkerContext, concurrency: int = 3) -> None:
+    sem = asyncio.Semaphore(concurrency)
+    running: set[asyncio.Task[None]] = set()
+
+    async def _run_one(item: WorkItem) -> None:
+        async with sem:
+            result = await _execute_item(item, ctx)
+            _record_work_failure(ctx, result)
+            for new_item in result.new_items:
+                await ctx.scheduler.submit(new_item)
+            _write_to_signal_pool(result, ctx.signal_pool)
+
+    try:
+        while True:
+            if not ctx.budget.can_start_track1():
+                break
+            _prune_done(running)
+            item = await ctx.scheduler.pull_matching(
+                lambda work: work.track == TRACK_GUARANTEED,
+                timeout=0.05,
+            )
+            if item is None:
+                if ctx.scheduler.is_empty() and not running:
+                    break
+                await asyncio.sleep(0)
+                continue
+            task = asyncio.create_task(_run_one(item))
+            running.add(task)
+    except asyncio.CancelledError:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        raise
+
+    if running:
+        outcomes = await asyncio.gather(*running, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                logger.error("Guaranteed harvest task failed: %r", outcome)
+    ctx.budget.mark_track1_closed()
+
+
+async def _track2_loop(ctx: WorkerContext, concurrency: int = 5) -> None:
+    sem = asyncio.Semaphore(concurrency)
+    running: set[asyncio.Task[None]] = set()
+
+    async def _run_one(item: WorkItem) -> None:
+        async with sem:
+            result = await _execute_item(item, ctx)
+            _record_work_failure(ctx, result)
+            for new_item in result.new_items:
+                if new_item.track == TRACK_GUARANTEED:
+                    new_item.track = TRACK_OPPORTUNISTIC
+                await ctx.scheduler.submit(new_item)
+            _write_to_signal_pool(result, ctx.signal_pool)
+
+    def _is_person_pivot(item: WorkItem) -> bool:
+        return (
+            item.kind == "generate_patterns"
+            or item.module_name in _PERSON_PIVOT_MODULES
+        )
+
+    try:
+        while True:
+            # We must still pull one item inside the reserve window so a
+            # person-keyed pivot can run; non-pivot work is requeued below.
+            if ctx.budget.is_expired():
+                break
+            _prune_done(running)
+            item = await ctx.scheduler.pull_matching(
+                lambda work: work.track == TRACK_OPPORTUNISTIC,
+                timeout=0.05,
+            )
+            if item is None:
+                if ctx.scheduler.is_empty() and not running:
+                    break
+                # A producer may have drained immediately after the pull.
+                # Recheck after yielding briefly so an empty queue cannot
+                # hold track 2 open until the full harvest budget expires.
+                if ctx.scheduler.is_empty():
+                    await asyncio.sleep(0.01)
+                    if ctx.scheduler.is_empty() and not running:
+                        break
+                await asyncio.sleep(0)
+                continue
+            if not ctx.budget.can_start_track2(person_pivot=_is_person_pivot(item)):
+                # Put the non-pivot work back and preserve the final budget tail
+                # for names discovered late in the run.
+                await ctx.scheduler.requeue(item)
+                break
+            task = asyncio.create_task(_run_one(item))
+            running.add(task)
+    except asyncio.CancelledError:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        raise
+
+    if running:
+        outcomes = await asyncio.gather(*running, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                logger.error("Opportunistic harvest task failed: %r", outcome)
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+")
+
+
+def _on_domain_email_count(ctx: WorkerContext) -> int:
+    """Unique on-domain emails discovered so far.
+
+    Phase 5B — the CC-first best-effort fallback reads this to decide whether the
+    block-prone live-search dork is still needed. Robust to how each module
+    surfaces addresses: regex-extracts any ``…@domain`` token from each recorded
+    finding rather than assuming a fixed key.
+    """
+    domain_suffix = "@" + ctx.domain.lower()
+    seen: set[str] = set()
+    for res in (ctx.module_results or {}).values():
+        for finding in getattr(res, "findings", None) or []:
+            if not isinstance(finding, dict):
+                continue
+            for token in _EMAIL_RE.findall(str(finding)):
+                addr = token.lower()
+                if addr.endswith(domain_suffix):
+                    seen.add(addr)
+    return len(seen)
+
+
+async def _execute_item(item: WorkItem, ctx: WorkerContext) -> WorkResult:
+    start = asyncio.get_event_loop().time()
+    # Phase 3 fix: track-2 modules (employee_name_discovery, pattern_and_verify)
+    # can be slow (DDG/Bing search + structured page fetch + ML classification).
+    # Using 0.75 fraction instead of the default 0.10 gives them up to 75% of
+    # the remaining budget as soft timeout — sufficient for ~10s DDG requests
+    # even on a 90s total budget (vs. the old 9s which was too short).
+    is_track2 = getattr(item, "track", None) == TRACK_OPPORTUNISTIC
+    fraction = 0.75 if is_track2 else 0.10
+    try:
+        soft_timeout = ctx.budget.soft_timeout_for_module(fraction=fraction)
+    except TypeError:
+        # Keep lightweight test doubles and older embedders compatible with
+        # the pre-fraction budget interface.
+        soft_timeout = ctx.budget.soft_timeout_for_module()
+    try:
+        if item.module_name and item.module_name in ctx.skip_modules:
+            skip_result = ModuleResult(
+                status=ModuleStatus.SKIPPED,
+                metadata={"domain": ctx.domain, "skip_reason": "runtime_policy"},
+            )
+            _record_module_result(ctx, item.module_name, skip_result)
+            _emit_module_complete(ctx, item.module_name, skip_result)
+            return WorkResult(
+                item=item,
+                success=True,
+                findings=[],
+                new_items=[],
+                errors=["skipped by runtime policy"],
+                duration_seconds=0.0,
+            )
+        # MailAccess Index had results: the live Common Crawl lookup is skipped
+        # for this run (the index is built from the same crawls).
+        own_hits = int(getattr(ctx, "own_index_hits", 0) or 0)
+        if item.module_name == MODULE_COMMONCRAWL and own_hits > 0:
+            skip_result = _own_index_cc_skip_result(ctx)
+            _record_module_result(ctx, item.module_name, skip_result)
+            _emit_module_complete(ctx, item.module_name, skip_result)
+            return WorkResult(
+                item=item,
+                success=True,
+                findings=[],
+                new_items=[],
+                errors=["skipped: own index had results"],
+                duration_seconds=0.0,
+            )
+        # Phase 5B — CC-first best-effort fallback. When cc_first and the cheap
+        # (non-search) on-domain sources have ALREADY recorded enough on-domain
+        # emails by the time the live-search dork is pulled, skip the dork — it
+        # never touches DDG/Bing. Zero-latency and side-effect-free: it reads the
+        # yield recorded so far and skips only when the cheap sources genuinely
+        # sufficed (on CC-covered domains). When they under-deliver, the dork
+        # runs as the fallback. (Per-module circuit-breaking already bounds the
+        # block count when it does run.)
+        if (
+            item.module_name == MODULE_EMAIL_DORK
+            and bool(getattr(ctx.settings, "cc_first", True))
+            and int(getattr(ctx.settings, "cc_first_min_emails", 3)) > 0
+            and _on_domain_email_count(ctx)
+            >= int(getattr(ctx.settings, "cc_first_min_emails", 3))
+        ):
+            skip_result = ModuleResult(
+                status=ModuleStatus.SKIPPED,
+                metadata={
+                    "domain": ctx.domain,
+                    "skip_reason": "cc_first_sufficient_yield",
+                    "on_domain_emails": _on_domain_email_count(ctx),
+                },
+            )
+            _record_module_result(ctx, item.module_name, skip_result)
+            _emit_module_complete(ctx, item.module_name, skip_result)
+            return WorkResult(
+                item=item,
+                success=True,
+                findings=[],
+                new_items=[],
+                errors=["skipped: cc-first sufficient on-domain yield"],
+                duration_seconds=0.0,
+            )
+        if (
+            item.module_name == MODULE_PATTERN_VERIFY
+            and ctx.provider_detection_ready is not None
+            and not ctx.provider_detection_ready.is_set()
+        ):
+            await ctx.provider_detection_ready.wait()
+        # C1→C2: pattern_and_verify consumes employee_name_discovery's names, so wait
+        # for that module to finish first. Bounded so a stuck/slow employee run can
+        # never deadlock pattern — after the cap it proceeds with whatever is ready.
+        if (
+            item.module_name == MODULE_PATTERN_VERIFY
+            and ctx.employee_names_ready is not None
+            and not ctx.employee_names_ready.is_set()
+        ):
+            try:
+                await asyncio.wait_for(
+                    ctx.employee_names_ready.wait(), timeout=_EMPLOYEE_READY_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "pattern_and_verify proceeding without employee names "
+                    "(barrier timed out after %.0fs)",
+                    _EMPLOYEE_READY_TIMEOUT,
+                )
+        if ctx.subdomain_calibrate and item.module_name != MODULE_SUBDOMAIN_INTEL:
+            if item.module_name:
+                skip_result = ModuleResult(
+                    status=ModuleStatus.SKIPPED,
+                    metadata={
+                        "domain": ctx.domain,
+                        "skip_reason": "subdomain_calibration",
+                    },
+                )
+                _record_module_result(ctx, item.module_name, skip_result)
+                _emit_module_complete(ctx, item.module_name, skip_result)
+            return WorkResult(
+                item=item,
+                success=True,
+                findings=[],
+                new_items=[],
+                errors=["skipped for subdomain calibration"],
+                duration_seconds=0.0,
+            )
+        if item.module_name and _should_defer_for_yield(ctx, item.module_name):
+            skip_result = ModuleResult(
+                status=ModuleStatus.SKIPPED,
+                metadata={"domain": ctx.domain, "skip_reason": "yield_prediction"},
+            )
+            _record_module_result(ctx, item.module_name, skip_result)
+            _emit_module_complete(ctx, item.module_name, skip_result)
+            return WorkResult(
+                item=item,
+                success=True,
+                findings=[],
+                new_items=[],
+                errors=["deferred by yield prediction"],
+                duration_seconds=0.0,
+            )
+        if item.kind == "provider_detection":
+            await _ensure_provider_detection(ctx)
+            findings, new_items = [], []
+        elif item.kind == "fetch_page" and item.url:
+            findings, new_items = await _fetch_and_extract(item.url, ctx)
+        elif item.kind == "run_module" and item.module_name:
+            if item.module_name == MODULE_SUBDOMAIN_INTEL:
+                findings, new_items = await _run_subdomain_intel_with_hard_cap(ctx)
+            else:
+                module = _get_module_instance(item.module_name, ctx)
+                if item.payload and hasattr(module, "run_with_payload"):
+                    findings, new_items = await _run_module_with_payload(
+                        item.module_name,
+                        module,
+                        item.payload,
+                        ctx,
+                        soft_timeout,
+                    )
+                else:
+                    findings, new_items = await _run_module(
+                        item.module_name,
+                        ctx,
+                        soft_timeout,
+                    )
+        elif item.kind == "generate_patterns":
+            findings, new_items = await _run_pattern_for_name(
+                item.payload, ctx
+            )
+        else:
+            findings, new_items = [], []
+        return WorkResult(
+            item=item,
+            success=True,
+            findings=findings,
+            new_items=new_items,
+            errors=[],
+            duration_seconds=asyncio.get_event_loop().time() - start,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return WorkResult(
+            item=item,
+            success=False,
+            findings=[],
+            new_items=[],
+            errors=[str(exc)],
+            duration_seconds=asyncio.get_event_loop().time() - start,
+        )
+
+
+def _should_defer_for_yield(ctx: WorkerContext, module_name: str) -> bool:
+    """Defer only low-yield candidates in the final budget tail.
+
+    At least two earlier registry/archive sources must have completed with no
+    findings. High-signal and guaranteed modules are never deferred here.
+    """
+    if module_name not in _YIELD_PREDICTION_CANDIDATES:
+        return False
+    if not getattr(ctx.settings, "enable_yield_prediction", True):
+        return False
+    tail = float(getattr(ctx.settings, "yield_prediction_tail_seconds", 15.0) or 15.0)
+    if ctx.budget.remaining() > tail:
+        return False
+    results = ctx.module_results or {}
+    observed = [
+        results.get(name)
+        for name in (
+            MODULE_COMMONCRAWL,
+            MODULE_WAYBACK_DOMAIN,
+            MODULE_NPM_EMAIL,
+            MODULE_PYPI_EMAIL,
+            MODULE_PGP_DOMAIN_EMAIL,
+        )
+    ]
+    completed = [
+        item
+        for item in observed
+        if item is not None and item.status in {ModuleStatus.SUCCESS, ModuleStatus.PARTIAL}
+    ]
+    return len(completed) >= 2 and sum(len(item.findings or []) for item in completed) == 0
+
+
+async def _fetch_and_extract(
+    url: str,
+    ctx: WorkerContext,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    response = await ctx.page_cache.get(url)
+    html = getattr(response, "text", "") or ""
+    if not html:
+        content = getattr(response, "content", b"") or b""
+        if isinstance(content, bytes | bytearray):
+            html = bytes(content).decode("utf-8", errors="replace")
+    if not html:
+        return [], []
+
+    findings: list[dict[str, Any]] = []
+    for extracted in extract_emails(html, ctx.domain):
+        findings.append(
+            {
+                "platform": "structured_page",
+                "profile_url": url,
+                "username": extracted.email.split("@", 1)[0],
+                "confidence": "medium",
+                "metadata": {
+                    "email": extracted.email,
+                    "on_domain": extracted.on_domain,
+                    "source_url": url,
+                    "source_type": "structured_page",
+                    "confidence_score": 0.7,
+                    "source_text_snippet": extracted.source_text_snippet,
+                },
+            }
+        )
+
+    # Blog/profile pages use the same full person extractor as the normal
+    # site-intelligence fetch path. This preserves names and direct emails
+    # discovered in JSON-LD, hCards, mailto links, LinkedIn slugs, and other
+    # structured page surfaces.
+    for person in extract_people(
+        html,
+        url,
+        ctx.domain,
+        aggressive=ctx.aggressive,
+    ):
+        metadata = {
+            "name": person.name,
+            "person_name": person.name,
+            "title_or_role": person.title,
+            "source_type": person.source_type,
+            "confidence_score": person.confidence,
+            "source_url": person.page_url,
+            "on_domain": bool(
+                person.email and person.email.lower().endswith("@" + ctx.domain.lower())
+            ),
+        }
+        if person.email:
+            metadata["email"] = person.email
+        findings.append(
+            {
+                "platform": "structured_page",
+                "profile_url": url,
+                "username": person.email.split("@", 1)[0] if person.email else person.name,
+                "confidence": "high" if person.confidence >= 0.7 else "medium",
+                "metadata": metadata,
+            }
+        )
+
+    next_url = PaginationHandler(ctx.page_cache).extract_next_url(url, html)
+    new_items = []
+    if next_url:
+        new_items.append(
+            WorkItem(
+                kind="fetch_page",
+                url=next_url,
+                priority=PRIORITY_ROUTER_EXPANSION,
+                track=TRACK_GUARANTEED,
+                source="pagination",
+            )
+        )
+    return findings, new_items
+
+
+async def _run_module(
+    module_name: str,
+    ctx: WorkerContext,
+    soft_timeout: float,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    return await _run_module_core(
+        module_name,
+        ctx,
+        soft_timeout=soft_timeout,
+        outer_timeout=True,
+    )
+
+
+def _partial_subdomain_result(module: Any, ctx: WorkerContext) -> ModuleResult:
+    """Build a cancellation result without discarding live discoveries."""
+    existing = (ctx.module_results or {}).get(MODULE_SUBDOMAIN_INTEL)
+    existing_findings = list(getattr(existing, "findings", None) or [])
+    partial_findings = list(
+        getattr(module, "partial_findings", lambda: [])() or []
+    )
+    findings = existing_findings or partial_findings
+    metadata = dict(
+        getattr(module, "partial_metadata", lambda: {})() or {}
+    )
+    metadata.setdefault("domain", ctx.domain)
+    return ModuleResult(
+        status=ModuleStatus.PARTIAL,
+        findings=findings,
+        errors=["Cancelled by subdomain_intel hard cap"],
+        metadata=metadata,
+    )
+
+
+def _module_outputs(
+    result: ModuleResult | None,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    if result is None:
+        return [], []
+    findings = [dict(f) for f in (result.findings or []) if isinstance(f, dict)]
+    new_items = result.new_items if hasattr(result, "new_items") else []
+    return findings, new_items
+
+
+def _ensure_subdomain_partial_result(ctx: WorkerContext) -> ModuleResult:
+    """Publish a partial result when a test double or adapter owns the task."""
+    existing = (ctx.module_results or {}).get(MODULE_SUBDOMAIN_INTEL)
+    if existing is not None and existing.status is ModuleStatus.PARTIAL:
+        return existing
+    metadata = dict(getattr(existing, "metadata", None) or {})
+    metadata.setdefault("domain", ctx.domain)
+    result = ModuleResult(
+        status=ModuleStatus.PARTIAL,
+        findings=list(getattr(existing, "findings", None) or []),
+        errors=["Cancelled by subdomain_intel hard cap"],
+        metadata=metadata,
+    )
+    _record_module_result(ctx, MODULE_SUBDOMAIN_INTEL, result)
+    _emit_module_complete(ctx, MODULE_SUBDOMAIN_INTEL, result)
+    return result
+
+
+def _module_partial(module: Any) -> dict[str, Any]:
+    """R8 (S2) — generic partial-result recovery on cancellation.
+
+    A producer opts in by exposing ``partial_findings()`` and/or
+    ``partial_metadata()`` so the findings it streamed before a budget-timeout
+    cancellation are preserved rather than discarded. Modules that don't
+    implement the hook yield an empty partial exactly as before (no regression).
+    """
+    findings: list[Any] = []
+    metadata: dict[str, Any] = {}
+    getter = getattr(module, "partial_findings", None)
+    if callable(getter):
+        try:
+            findings = list(getter() or [])
+        except Exception:
+            findings = []
+    meta_getter = getattr(module, "partial_metadata", None)
+    if callable(meta_getter):
+        try:
+            metadata = dict(meta_getter() or {})
+        except Exception:
+            metadata = {}
+    return {"findings": findings, "metadata": metadata}
+
+
+OWN_INDEX_CC_SKIP_REASON = "own_index_had_results"
+
+
+def _own_index_cc_skip_result(ctx: WorkerContext) -> ModuleResult:
+    return ModuleResult(
+        status=ModuleStatus.SKIPPED,
+        metadata={
+            "domain": ctx.domain,
+            "skip_reason": OWN_INDEX_CC_SKIP_REASON,
+            "skip_note": "skipped: own index had results",
+            "own_index_emails": ctx.own_index_hits,
+        },
+    )
+
+
+async def _run_own_index_first(ctx: WorkerContext) -> None:
+    """Run the MailAccess Index lookup before discovery; never raises."""
+    budget_s = max(0.1, float(getattr(ctx.settings, "own_index_budget_seconds", 30.0) or 30.0))
+    soft = max(0.1, min(budget_s, ctx.budget.remaining()))
+    try:
+        findings, _new = await _run_module_core(
+            MODULE_OWN_INDEX, ctx, soft_timeout=soft, outer_timeout=True
+        )
+    except Exception as exc:  # noqa: BLE001 - an index failure is "no results"
+        logger.info("own_index failed: %s", exc)
+        findings = []
+    hits = sum(
+        1 for f in findings
+        if isinstance(f, dict) and isinstance(f.get("metadata"), dict)
+        and (f.get("metadata") or {}).get("email")
+    )
+    ctx.own_index_hits_box[0] = hits
+    if hits > 0 and MODULE_COMMONCRAWL not in ctx.skip_modules:
+        # Record the skip now (the seeded CC item is answered from this when the
+        # track pulls it), so the trace shows why CC did not run.
+        if ctx.module_results is not None:
+            ctx.module_results[MODULE_COMMONCRAWL] = _own_index_cc_skip_result(ctx)
+        if ctx.log_callback is not None:
+            with contextlib.suppress(Exception):
+                ctx.log_callback(
+                    "MODULE",
+                    f"commoncrawl_email skipped: own index had results ({hits} emails)",
+                )
+
+
+def _running_of(ctx: Any) -> dict[str, Any]:
+    """The context's in-flight module registry (a throwaway dict for test doubles
+    and older embedders whose context has none)."""
+    running = getattr(ctx, "running_modules", None)
+    return running if isinstance(running, dict) else {}
+
+
+def _abandon_running_modules(ctx: WorkerContext) -> list[str]:
+    """At the hard deadline: name every module still in flight and record it.
+
+    A module that unwound on cancellation has already recorded its own PARTIAL
+    result. One that is stuck (ignores cancellation, or waits on a thread) gets a
+    PARTIAL result here carrying whatever it streamed so far, so the export shows
+    it was cut off by the timeout instead of silently missing.
+    """
+    running = dict(_running_of(ctx))
+    names = sorted(running)
+    for name, entry in running.items():
+        module, started = entry if isinstance(entry, tuple) else (entry, None)
+        existing = (ctx.module_results or {}).get(name)
+        if existing is not None and existing.status is not ModuleStatus.SKIPPED:
+            # It already reported (e.g. cancelled cleanly); just tag the cause.
+            if not any("timeout" in str(err) for err in existing.errors or []):
+                existing.errors = [
+                    *(existing.errors or []),
+                    "still running at the harvest timeout",
+                ]
+            continue
+        recovered = _module_partial(module)
+        elapsed = round(time.perf_counter() - started, 3) if started else None
+        result = ModuleResult(
+            status=ModuleStatus.PARTIAL,
+            findings=recovered["findings"],
+            errors=["still running at the harvest timeout; abandoned"],
+            metadata={
+                "domain": ctx.domain,
+                **({"duration_seconds": elapsed} if elapsed is not None else {}),
+                **recovered["metadata"],
+            },
+        )
+        with contextlib.suppress(Exception):
+            _record_module_result(ctx, name, result)
+            _emit_module_complete(ctx, name, result)
+            for finding in result.findings or []:
+                _emit_finding(ctx.signal_pool, name, finding, ctx.domain)
+    return names
+
+
+async def _run_module_core(
+    module_name: str,
+    ctx: WorkerContext,
+    *,
+    soft_timeout: float | None,
+    outer_timeout: bool,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    module = _get_module_instance(module_name, ctx)
+    started = time.perf_counter()
+    if ctx.progress_callback is not None:
+        ctx.progress_callback(module_name, "Starting module...")
+    result: ModuleResult | None = None
+    _running_of(ctx)[module_name] = (module, started)
+    try:
+        instance = _run_module_instance(module_name, module, ctx, soft_timeout)
+        if outer_timeout:
+            assert soft_timeout is not None
+            # _run_module_instance applies the same soft timeout internally
+            # and returns a PARTIAL result. A small grace window prevents the
+            # outer guard from cancelling that result at the exact deadline.
+            # Hard: a module that ignores the cancellation is abandoned.
+            finished, result = await wait_hard(
+                instance, soft_timeout + 1.0, grace=CANCEL_GRACE_SECONDS
+            )
+            if not finished:
+                raise asyncio.TimeoutError
+        else:
+            # subdomain_intel is governed by the explicit task hard wall. Do
+            # not install a second soft timeout around the module coroutine.
+            result = await instance
+    except asyncio.TimeoutError:
+        elapsed = round(time.perf_counter() - started, 3)
+        partial_metadata = {}
+        if module_name == MODULE_SUBDOMAIN_INTEL:
+            partial_metadata = getattr(module, "partial_metadata", lambda: {})()
+        timeout_label = soft_timeout if soft_timeout is not None else elapsed
+        result = ModuleResult(
+            status=ModuleStatus.FAILED,
+            errors=[f"module timed out after {timeout_label:.1f}s"],
+            metadata={"domain": ctx.domain, **partial_metadata, "duration_seconds": elapsed},
+        )
+    except asyncio.CancelledError:
+        elapsed = round(time.perf_counter() - started, 3)
+        if module_name == MODULE_SUBDOMAIN_INTEL:
+            result = _partial_subdomain_result(module, ctx)
+        else:
+            # R8 (S2) — preserve any findings the module streamed before the
+            # cancellation instead of discarding them (no timeout is a silent
+            # data loss). Empty for modules that don't expose the hook.
+            recovered = _module_partial(module)
+            result = ModuleResult(
+                status=ModuleStatus.PARTIAL,
+                findings=recovered["findings"],
+                errors=["Cancelled by budget timeout"],
+                metadata={
+                    "domain": ctx.domain,
+                    "duration_seconds": elapsed,
+                    **recovered["metadata"],
+                },
+            )
+        raise
+    finally:
+        _running_of(ctx).pop(module_name, None)
+        if result is not None:
+            result.metadata.setdefault(
+                "duration_seconds", round(time.perf_counter() - started, 3)
+            )
+            _record_module_result(ctx, module_name, result)
+            _emit_module_complete(ctx, module_name, result)
+            for finding in result.findings or []:
+                _emit_finding(ctx.signal_pool, module_name, finding, ctx.domain)
+
+    assert result is not None
+    out_findings, new_items = _module_outputs(result)
+    if module_name == MODULE_EMPLOYEE_NAMES:
+        names = [
+            {
+                "name": (finding.get("metadata") or {}).get("name"),
+                "title_or_role": (finding.get("metadata") or {}).get("title_or_role"),
+            }
+            for finding in result.findings or []
+            if isinstance(finding, dict)
+            and isinstance(finding.get("metadata"), dict)
+            and (finding.get("metadata") or {}).get("name")
+        ]
+        if names:
+            sourced = [
+                e["email"] for e in (ctx.signal_pool.get_emails(ctx.domain) if ctx.signal_pool else [])
+                if isinstance(e, dict) and e.get("email")
+            ]
+            new_items.append(WorkItem(
+                kind="run_module",
+                module_name=MODULE_PERSON_EMAIL_PIVOT,
+                payload={
+                    "domain": ctx.domain,
+                    "names": names,
+                    "sourced_emails": sourced,
+                    "own_index_active": bool(ctx.own_index_enabled),
+                },
+                priority=PRIORITY_HIGH_SIGNAL,
+                track=TRACK_OPPORTUNISTIC,
+                source="employee_name_discovery_complete",
+            ))
+    return out_findings, new_items
+
+
+async def _ensure_provider_detection(ctx: WorkerContext) -> Any:
+    """Resolve and classify MX exactly once for this harvest context."""
+    if ctx.provider_detection is not None:
+        if ctx.provider_detection_ready is not None:
+            ctx.provider_detection_ready.set()
+        return ctx.provider_detection
+    if ctx.module_overrides:
+        return None
+    try:
+        mx_records = await resolve_mx(ctx.domain)
+        detection = detect_provider_from_mx(mx_records, target_domain=ctx.domain)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Provider detection failed for %s: %s", ctx.domain, exc)
+        mx_records = []
+        detection = detect_provider_from_mx([], target_domain=ctx.domain)
+    object.__setattr__(ctx, "provider_mx_records", list(mx_records))
+    object.__setattr__(ctx, "provider_detection", detection)
+    if ctx.provider_detection_ready is not None:
+        ctx.provider_detection_ready.set()
+    return detection
+
+
+async def run_subdomain_intel(
+    ctx: WorkerContext,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    """Run subdomain_intel without the generic module soft timeout."""
+    return await _run_module_core(
+        MODULE_SUBDOMAIN_INTEL,
+        ctx,
+        # _safe_phase12_run interprets None as "derive the generic soft
+        # timeout from ctx.budget". Infinity disables that inner boundary;
+        # _run_subdomain_intel_with_hard_cap owns the real wall.
+        soft_timeout=float("inf"),
+        outer_timeout=False,
+    )
+
+
+async def _run_subdomain_intel_with_hard_cap(
+    ctx: WorkerContext,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    """Run subdomain_intel in a tracked task with a real cancellation wall."""
+    hard_cap = float(
+        getattr(ctx, "subdomain_intel_hard_cap", SUBDOMAIN_INTEL_HARD_CAP)
+    )
+    started = time.perf_counter()
+    subdomain_task = asyncio.ensure_future(run_subdomain_intel(ctx))
+
+    def write_duration() -> ModuleResult:
+        result = _ensure_subdomain_partial_result(ctx)
+        metadata = dict(result.metadata or {})
+        metadata["duration_seconds"] = round(time.perf_counter() - started, 3)
+        result.metadata = metadata
+        if ctx.module_results is not None:
+            ctx.module_results[MODULE_SUBDOMAIN_INTEL] = result
+        return result
+
+    _running_of(ctx).setdefault(MODULE_SUBDOMAIN_INTEL, (None, started))
+    try:
+        done, _ = await asyncio.wait({subdomain_task}, timeout=hard_cap)
+        if subdomain_task in done:
+            return subdomain_task.result()
+        raise asyncio.TimeoutError
+    except asyncio.TimeoutError:
+        subdomain_task.cancel()
+        # Bounded: a task that ignores the cancellation is abandoned.
+        await asyncio.wait({subdomain_task}, timeout=CANCEL_GRACE_SECONDS)
+        logger.warning(
+            "subdomain_intel cancelled at hard cap %ds",
+            hard_cap,
+        )
+        return _module_outputs(write_duration())
+    except asyncio.CancelledError:
+        # If the harvest itself is cancelled, do not leave the child task
+        # running after its parent has unwound.
+        subdomain_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({subdomain_task}, timeout=CANCEL_GRACE_SECONDS)
+        write_duration()
+        raise
+    finally:
+        _running_of(ctx).pop(MODULE_SUBDOMAIN_INTEL, None)
+
+
+async def _run_module_with_payload(
+    module_name: str,
+    module: Any,
+    payload: dict,
+    ctx: WorkerContext,
+    soft_timeout: float,
+) -> tuple[list[dict[str, Any]], list[WorkItem]]:
+    started = time.perf_counter()
+    if ctx.progress_callback is not None:
+        ctx.progress_callback(module_name, "Starting module...")
+    result: ModuleResult | None = None
+    try:
+        # Person-keyed pivots must use the same per-run cache/session as the
+        # rest of harvest.  Passing it explicitly also keeps the module
+        # independently testable without relying on a mutable ``session``
+        # attribute being injected after construction.
+        run_with_payload = module.run_with_payload
+        try:
+            parameters = inspect.signature(run_with_payload).parameters
+            accepts_fetch = "fetch" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            # Async mocks and dynamically generated modules may not expose a
+            # signature; pass the new keyword and let the module decide.
+            accepts_fetch = True
+        kwargs = {"fetch": ctx.page_cache} if accepts_fetch else {}
+        if ctx.progress_callback is not None:
+            try:
+                accepts_progress = "progress_callback" in parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+            except UnboundLocalError:
+                accepts_progress = True
+            if accepts_progress:
+                kwargs["progress_callback"] = (
+                    lambda action: ctx.progress_callback(module_name, action)
+                )
+        _running_of(ctx)[module_name] = (module, started)
+        finished, result = await wait_hard(
+            run_with_payload(payload, **kwargs),
+            soft_timeout,
+            grace=CANCEL_GRACE_SECONDS,
+        )
+        if not finished:
+            raise asyncio.TimeoutError
+    except asyncio.TimeoutError:
+        elapsed = round(time.perf_counter() - started, 3)
+        result = ModuleResult(
+            status=ModuleStatus.FAILED,
+            errors=[f"module timed out after {soft_timeout:.1f}s"],
+            metadata={"domain": ctx.domain, "duration_seconds": elapsed},
+        )
+    except asyncio.CancelledError:
+        elapsed = round(time.perf_counter() - started, 3)
+        result = ModuleResult(
+            status=ModuleStatus.PARTIAL,
+            findings=[],
+            errors=["Cancelled by budget timeout"],
+            metadata={"domain": ctx.domain, "duration_seconds": elapsed},
+        )
+        raise
+    finally:
+        _running_of(ctx).pop(module_name, None)
+        if result is not None:
+            result.metadata.setdefault(
+                "duration_seconds", round(time.perf_counter() - started, 3)
+            )
+            _record_module_result(ctx, module_name, result)
+            _emit_module_complete(ctx, module_name, result)
+            for finding in result.findings or []:
+                _emit_finding(ctx.signal_pool, module_name, finding, ctx.domain)
+
+    assert result is not None
+    out_findings = [dict(f) for f in (result.findings or []) if isinstance(f, dict)]
+    new_items = result.new_items if hasattr(result, "new_items") else []
+    return out_findings, new_items
+
+
+def _signal_pool_stats(signal_pool: Any) -> dict[str, int]:
+    """Best-effort snapshot of signal-pool throughput incl. dropped signals (Q5/0.3)."""
+    try:
+        stats = signal_pool.stats()
+        return {
+            "signals": int(getattr(stats, "signals", 0)),
+            "clusters": int(getattr(stats, "clusters", 0)),
+            "exports": int(getattr(stats, "exports", 0)),
+            "dropped": int(getattr(stats, "dropped", 0)),
+        }
+    except Exception:
+        return {"signals": 0, "clusters": 0, "exports": 0, "dropped": 0}
+
+
+def _record_module_result(
+    ctx: WorkerContext, module_name: str, result: ModuleResult
+) -> None:
+    """Store results without discarding earlier reactive pivot findings."""
+    if ctx.module_results is None:
+        return
+    state = getattr(ctx, "pattern_run_state", None)
+    if state is not None:
+        state.resolver.retain_result(module_name, result)
+    # Release the C1→C2 barrier once employee_name_discovery reaches any terminal
+    # state (it is not an accumulating module, so this path always runs for it), so
+    # pattern_and_verify reads a populated — or definitively empty — employee result
+    # rather than racing it.
+    if module_name == MODULE_EMPLOYEE_NAMES and ctx.employee_names_ready is not None:
+        ctx.employee_names_ready.set()
+    if module_name not in _ACCUMULATING_MODULES:
+        ctx.module_results[module_name] = result
+        return
+
+    previous = ctx.module_results.get(module_name)
+    if previous is None:
+        ctx.module_results[module_name] = result
+        return
+
+    previous_findings = [item for item in (previous.findings or []) if isinstance(item, dict)]
+    current_findings = [item for item in (result.findings or []) if isinstance(item, dict)]
+    metadata = dict(previous.metadata or {})
+    for key, value in (result.metadata or {}).items():
+        if key == "generation_decisions" and isinstance(value, dict):
+            counts = dict(metadata.get(key) or {})
+            for decision, count in value.items():
+                counts[decision] = counts.get(decision, 0) + count
+            metadata[key] = counts
+        elif key in {"per_person", "sources"} and isinstance(value, list):
+            existing = metadata.get(key)
+            metadata[key] = [*(existing if isinstance(existing, list) else []), *value]
+        elif (
+            key.endswith("_found")
+            or key.endswith("_attempted")
+            or key.endswith("_checked")
+            or key == "findings_count"
+        ):
+            try:
+                metadata[key] = int(metadata.get(key, 0)) + int(value)
+            except (TypeError, ValueError):
+                metadata[key] = value
+        else:
+            metadata[key] = value
+    if module_name == MODULE_EMAIL_IDENTITY_ENRICHMENT:
+        # Per-email enrichment can produce useful findings while one or more
+        # backing sources fail. Preserve that degraded health signal across
+        # the accumulating reactive runs instead of upgrading it to SUCCESS
+        # merely because a finding exists.
+        statuses = {previous.status, result.status}
+        if ModuleStatus.PARTIAL in statuses:
+            status = ModuleStatus.PARTIAL
+        elif ModuleStatus.SUCCESS in statuses:
+            status = ModuleStatus.SUCCESS
+        elif ModuleStatus.FAILED in statuses:
+            status = ModuleStatus.FAILED
+        else:
+            status = result.status
+    else:
+        status = ModuleStatus.SUCCESS if previous_findings or current_findings else (
+            ModuleStatus.PARTIAL
+            if previous.status == ModuleStatus.PARTIAL or result.status == ModuleStatus.PARTIAL
+            else result.status
+        )
+    ctx.module_results[module_name] = ModuleResult(
+        status=status,
+        findings=[*previous_findings, *current_findings],
+        errors=[*(previous.errors or []), *(result.errors or [])],
+        metadata=metadata,
+    )
+
+def _accumulate_pattern_findings(
+    ctx: WorkerContext, findings: list[dict], *, extra_meta: dict[str, Any] | None = None
+) -> None:
+    """Merge reactive pattern findings into the accumulating module result."""
+    if ctx.module_results is None:
+        return
+    existing = ctx.module_results.get(MODULE_PATTERN_VERIFY)
+    existing_findings: list[dict] = []
+    existing_metadata: dict[str, Any] = {}
+    if existing is not None:
+        existing_findings = list(existing.findings or [])
+        existing_metadata = dict(existing.metadata or {})
+    existing_metadata.update(
+        {
+            "generated_count": existing_metadata.get("generated_count", 0) + len(findings),
+            "smtp_verification_enabled": ctx.enable_smtp,
+        }
+    )
+    if extra_meta:
+        for k, v in extra_meta.items():
+            existing_metadata[k] = existing_metadata.get(k, 0) + v if isinstance(v, int) else v
+    ctx.module_results[MODULE_PATTERN_VERIFY] = ModuleResult(
+        status=ModuleStatus.SUCCESS,
+        findings=[*existing_findings, *findings],
+        metadata=existing_metadata,
+    )
+    ctx.pattern_run_state.resolver.retain_result(
+        MODULE_PATTERN_VERIFY, ctx.module_results[MODULE_PATTERN_VERIFY]
+    )
+
+
+def _finalize_person_selection(ctx: WorkerContext, unique_emails: list[Any]) -> list[Any]:
+    """Capstone finding — the TRUE-FINAL observed-beats-inferred pass at the export seam.
+
+    Person selection runs inside ``_aggregate`` mid-run, but email-set-mutating steps
+    (the enrichment waterfall, breach enrichment) and slow discovery modules that
+    complete late under a soft-timeout can introduce an OBSERVED address for a person
+    *after* that aggregate. So re-run :func:`_apply_resolver_person_selection` here,
+    over the fully-collected email set at the finalization/export boundary, so a
+    late-arriving observed address retires an already-emitted inference for the same
+    person. Idempotent — a second pass is a no-op if the aggregate already reconciled
+    everything. Guarded: a failure never loses the email set.
+    """
+    try:
+        from .domain_harvest_orchestrator import _apply_resolver_person_selection, _sort_key
+
+        selected = _apply_resolver_person_selection(
+            unique_emails, ctx.pattern_run_state.resolver
+        )
+        selected.sort(key=_sort_key)
+        return selected
+    except Exception:  # never drop the email set over a finalization pass
+        logger.exception("final person-selection pass failed; keeping unreconciled set")
+        return unique_emails
+
+
+def _record_pattern_decision(ctx: WorkerContext, decision: str) -> None:
+    """Brief B — account ONE reactive generation decision into module metadata.
+
+    Every input name receives an explicit, accounted decision (emitted, low name
+    evidence, observed coverage, suppressed, oracle-rejected, unindexed, apply /
+    governance error, …). The histogram rides on the ``pattern_and_verify`` module
+    result's ``generation_decisions`` metadata so it survives into final reporting —
+    an error can never masquerade as an ordinary miss or a generation success.
+    Synchronous read-modify-write (no ``await``), so it is race-free across
+    concurrent reactive workers under asyncio.
+    """
+    if ctx.module_results is None:
+        return
+    existing = ctx.module_results.get(MODULE_PATTERN_VERIFY)
+    findings = list(existing.findings or []) if existing is not None else []
+    metadata = dict(existing.metadata or {}) if existing is not None else {}
+    errors = list(existing.errors or []) if existing is not None else []
+    status = existing.status if existing is not None else ModuleStatus.SUCCESS
+    decisions = dict(metadata.get("generation_decisions") or {})
+    decisions[decision] = int(decisions.get(decision, 0)) + 1
+    metadata["generation_decisions"] = decisions
+    ctx.module_results[MODULE_PATTERN_VERIFY] = ModuleResult(
+        status=status, findings=findings, errors=errors, metadata=metadata
+    )
+
+
+async def _run_pattern_for_name(
+    payload: dict,
+    ctx: WorkerContext,
+) -> tuple[list[dict], list[WorkItem]]:
+    """Reactive per-name pattern generation.
+
+    0.16.0 fix-pass Root A / Brief B — this worker goes through the SAME governed
+    name→email generator as the batch module (:func:`govern_name_to_candidate`),
+    sharing one run-state (:attr:`WorkerContext.pattern_run_state`), the same
+    name-evidence gate, and the same accounted :class:`GovernOutcome`. On an indexed
+    domain a placeable, sufficiently-evidenced, unresolved name yields ONE governed,
+    honesty-capped unverified candidate (oracle-upgraded/dropped with the shared
+    budget). A plain corpus miss / unavailable index falls through to the untouched
+    spray; a low-name-evidence name, an observed/suppressed/oracle-rejected name, or
+    an apply/governance error emits NOTHING and never sprays. Every outcome is
+    recorded in the pattern module metadata so no input name is unaccounted for.
+    """
+    name = payload["name"]
+    domain = ctx.domain
+
+    if _is_obvious_non_person_name(name):
+        _record_pattern_decision(ctx, "not_person")
+        return [], []
+
+    from backend.core.name_classifier import classify_name
+
+    if not classify_name(name).is_person:
+        _record_pattern_decision(ctx, "not_person")
+        return [], []
+
+    from backend.core.pattern_candidate import (
+        DECISION_OBSERVED_COVERAGE,
+        DECISION_ORACLE_REJECTED,
+        DECISION_SUPPRESSED,
+        NameEvidence,
+        govern_name_to_candidate,
+        verify_pattern_candidate,
+    )
+    from backend.core.product_mode import get_active_mode
+    from backend.modules.pattern_and_verify import (
+        EmployeeNameResult,
+        _observed_person_index,
+        _pattern_candidate_finding,
+    )
+
+    run_state = ctx.pattern_run_state
+    run_state.seed_oracle_budget(
+        int(getattr(ctx.settings, "pattern_oracle_max_verifications_per_run", 50))
+    )
+    title = str(payload.get("title") or "").strip() or None
+    # Brief B — pass the discovering source's name confidence (and provenance) as
+    # structured name evidence so the governed generator applies the authoritative
+    # gate. The subscriber's pre-schedule filter is only an optimization; a payload
+    # that omits confidence gets the explicit missing-confidence policy (fail).
+    _conf = payload.get("confidence")
+    name_evidence = NameEvidence(
+        name=name,
+        confidence=(float(_conf) if isinstance(_conf, int | float) else None),
+        title=title,
+        provenance=str(payload.get("source") or "") or None,
+    )
+    observed_locals, observed_names = _observed_person_index(ctx.signal_pool, domain)
+
+    outcome = govern_name_to_candidate(
+        name_evidence,
+        domain,
+        mode=get_active_mode(),
+        run_state=run_state,
+        observed_localparts=observed_locals,
+        observed_name_keys=observed_names,
+    )
+    # A plain corpus miss / unavailable index — keep the exact legacy spray. The
+    # spray path owns this name's accounting (it is not a corpus generation).
+    if outcome.fallback_allowed:
+        _record_pattern_decision(ctx, outcome.decision)
+        return await _run_pattern_spray_for_name(payload, ctx)
+
+    # A weak name (low evidence) or an apply/governance error generates nothing and
+    # never sprays — an error must not masquerade as an ordinary three-address spray.
+    # Account the govern decision as the name's ONE final decision.
+    if not outcome.emitted:
+        _record_pattern_decision(ctx, outcome.decision)
+        # Record the name only for the index-handled no-emit outcomes (a confirmed
+        # person for downstream pivots), matching the legacy worker's name emission.
+        if outcome.decision in (
+            DECISION_OBSERVED_COVERAGE,
+            DECISION_SUPPRESSED,
+            DECISION_ORACLE_REJECTED,
+        ):
+            ctx.signal_pool.emit_name(
+                name, source="pattern_confirmed", confidence=0.55, domain=domain
+            )
+        return [], []
+
+    # The name is recorded (a confirmed person for downstream pivots).
+    ctx.signal_pool.emit_name(
+        name, source="pattern_confirmed", confidence=0.55, domain=domain
+    )
+
+    # One governed unverified candidate. Oracle-upgrade/drop it with the shared
+    # budget before it becomes a finding (m365 only; a no-op otherwise). The name's
+    # ONE final decision is recorded AFTER the oracle step so a govern-emitted
+    # candidate the oracle then rejects is accounted as ``oracle_rejected`` — not
+    # double-counted as both emitted and rejected.
+    candidate = await verify_pattern_candidate(
+        outcome.candidate, mode=get_active_mode(), run_state=run_state
+    )
+    if candidate is None:
+        # not_found — the mailbox does not exist (already tombstoned). Emit nothing.
+        _record_pattern_decision(ctx, DECISION_ORACLE_REJECTED)
+        return [], []
+    _record_pattern_decision(ctx, outcome.decision)  # emitted (survived the oracle)
+
+    # Tag the emitted address as a GENERATED inference so a later observed-coverage
+    # read (this run's ``_observed_person_index``) never mistakes it for an
+    # observation (the reverse-timing false-coverage guard).
+    ctx.signal_pool.emit_email(
+        candidate.email,
+        source="company_pattern_index",
+        confidence=float(candidate.confidence_score),
+        domain=domain,
+        is_inference=True,
+        verification=candidate.verification,
+    )
+    emp = EmployeeNameResult(name=name, title_or_role=title)
+    findings = [_pattern_candidate_finding(candidate, emp)]
+    _accumulate_pattern_findings(
+        ctx, findings, extra_meta={"company_pattern_emails": 1}
+    )
+    return findings, []
+
+
+async def _run_pattern_spray_for_name(
+    payload: dict,
+    ctx: WorkerContext,
+) -> tuple[list[dict], list[WorkItem]]:
+    """Legacy reactive permutation spray — the untouched non-indexed fallback."""
+    name = payload["name"]
+    domain = ctx.domain
+
+    from backend.core.email_pattern_generator import _PATTERN_TEMPLATES, generate_patterns
+
+    if "templates" in payload:
+        templates = payload["templates"]
+    elif payload.get("has_title"):
+        templates = None
+    else:
+        templates = _PATTERN_TEMPLATES[:3]
+
+    candidates = generate_patterns(name, domain, patterns=templates)
+    ctx.signal_pool.emit_name(
+        name,
+        source="pattern_confirmed",
+        confidence=0.55,
+        domain=domain,
+    )
+    findings = []
+    for c in candidates:
+        if ctx.pattern_run_state.is_tombstoned(c.email):
+            _record_pattern_decision(ctx, "oracle_rejected")
+            continue
+        ctx.signal_pool.emit_email(
+            c.email,
+            source="pattern_generated",
+            confidence=0.05,
+            domain=domain,
+            is_inference=True,
+        )
+        findings.append({
+            "platform": "pattern_and_verify",
+            "profile_url": c.email,
+            "confidence": "low",
+            "metadata": {
+                "email": c.email,
+                "source_name": name,
+                "pattern_template": c.pattern_template,
+                "verification_status": "unverified",
+                "confidence_score": 0.05,
+                # Root B — an explicit inference flag so aggregation classifies this
+                # guess as inferred (never observed), regardless of source-type.
+                "is_inference": True,
+            },
+        })
+    _accumulate_pattern_findings(ctx, findings)
+    return findings, []
+
+
+async def _on_name_found(
+    name: str,
+    source: str,
+    metadata: dict
+) -> list[WorkItem]:
+    from backend.core.email_pattern_generator import _PATTERN_TEMPLATES
+    from backend.core.name_classifier import classify_name
+    from backend.modules.employee_name_discovery import classify_role_bucket
+
+    if source == "own_index":
+        return []
+    confidence = float(metadata.get(
+        "confidence_score", 0.5
+    ))
+    medium_threshold = float(
+        getattr(settings, "pattern_medium_confidence_threshold", 0.50) or 0.50
+    )
+    if _is_obvious_non_person_name(name):
+        return []
+    result = classify_name(name)
+    if not result.is_person:
+        return []
+    tokens = name.strip().split()
+    if len(tokens) < 2:
+        return []
+    # Keep the reactive subscriber aligned with PatternAndVerifyModule's
+    # batch path: LOW-confidence names are recorded, but do not generate
+    # speculative permutations.
+    if confidence < medium_threshold:
+        return []
+    title_or_role = str(metadata.get("title_or_role", "")).strip()
+    has_title = bool(title_or_role)
+    role_bucket = classify_role_bucket(title_or_role)
+    if role_bucket == "executive":
+        first_template = "{first}@{domain}"
+        templates = [
+            first_template,
+            *[template for template in _PATTERN_TEMPLATES if template != first_template],
+        ]
+    else:
+        templates = None if has_title else _PATTERN_TEMPLATES[:3]
+    return [WorkItem(
+        kind="generate_patterns",
+        module_name=MODULE_PATTERN_VERIFY,
+        payload={
+            "name": name,
+            "title": title_or_role,
+            "confidence": confidence,
+            "has_title": has_title,
+            "templates": templates,
+        },
+        priority=PRIORITY_UNIVERSAL,
+        track=TRACK_OPPORTUNISTIC,
+        source=f"name_subscriber:{source}",
+    )]
+
+
+async def _on_email_found(
+    email: str,
+    source: str,
+    metadata: dict[str, Any],
+    seen: set[str],
+) -> list[WorkItem]:
+    """Schedule bounded identity enrichment for each personal email once."""
+    if metadata.get("is_role"):
+        return []
+    cleaned = str(email or "").strip().lower()
+    if "@" not in cleaned or cleaned in seen:
+        return []
+    seen.add(cleaned)
+    return [WorkItem(
+        kind="run_module",
+        module_name=MODULE_EMAIL_IDENTITY_ENRICHMENT,
+        payload={
+            "email": email,
+            "original_email": metadata.get("original_email") or email,
+            "trigger_source": source,
+        },
+        priority=PRIORITY_HIGH_SIGNAL,
+        track=TRACK_OPPORTUNISTIC,
+        source=f"email_subscriber:{source}",
+    )]
+
+
+async def _on_name_found_persona_pivot(
+    name: str,
+    source: str,
+    metadata: dict[str, Any],
+    seen: set[str] | None = None,
+) -> list[WorkItem]:
+    """Schedule at most one public-email pivot for a qualified person."""
+    confidence = float(metadata.get("confidence_score", metadata.get("confidence", 0.0)))
+    cleaned = " ".join(str(name).split())
+    if confidence < 0.50 or len(cleaned.split()) < 2:
+        return []
+    if not bool(getattr(settings, "persona_pivot_enabled", True)):
+        return []
+    if seen is not None:
+        key = cleaned.casefold()
+        if key in seen or len(seen) >= int(getattr(settings, "persona_pivot_max_names", 10)):
+            return []
+        seen.add(key)
+    return [WorkItem(
+        kind="run_module",
+        module_name=MODULE_PERSONA_EMAIL_PIVOT,
+        payload={
+            "name": cleaned,
+            "domain": metadata.get("domain", ""),
+            "title": metadata.get("title_or_role", ""),
+        },
+        priority=PRIORITY_HIGH_SIGNAL,
+        track=TRACK_OPPORTUNISTIC,
+        source="name_subscriber:persona_pivot",
+    )]
+
+async def _run_module_instance(
+    module_name: str,
+    module: Any,
+    ctx: WorkerContext,
+    soft_timeout: float,
+) -> ModuleResult:
+    from .domain_harvest_orchestrator import (
+        _employee_names_from_findings,
+        _normalize_module_result,
+        _run_hunter,
+        _run_netlas_cert,
+        _run_netlas_responses,
+        _run_netlas_whois,
+        _run_pattern,
+        _run_whoisfreaks_history,
+        _safe_phase12_run,
+    )
+
+    if module_name == MODULE_OWN_INDEX:
+        from .domain_harvest_orchestrator import _run_own_index
+
+        _name, result = await _run_own_index(
+            ctx.domain,
+            deadline=time.monotonic() + max(0.0, min(soft_timeout, ctx.budget.remaining())),
+        )
+        return _normalize_module_result(module_name, result)
+    if module_name == MODULE_WHOISFREAKS_HISTORY:
+        _name, result = await _run_whoisfreaks_history(
+            ctx.domain,
+            refresh=ctx.whoisfreaks_refresh,
+            no_whoisfreaks=ctx.no_whoisfreaks,
+            deadline=time.monotonic() + max(0.0, ctx.budget.remaining()),
+        )
+        return _normalize_module_result(module_name, result)
+    if module_name == MODULE_NETLAS_WHOIS:
+        _name, result = await _run_netlas_whois(ctx.domain)
+        return _normalize_module_result(module_name, result)
+    if module_name == MODULE_NETLAS_RESPONSES:
+        _name, result = await _run_netlas_responses(ctx.domain)
+        return _normalize_module_result(module_name, result)
+    if module_name == MODULE_NETLAS_CERT:
+        _name, result = await _run_netlas_cert(ctx.domain, _netlas_cert_future(ctx))
+        return _normalize_module_result(module_name, result)
+
+    if module_name == MODULE_HUNTER:
+        _name, result = await _run_hunter(ctx.domain, ctx.settings.hunter_io_api_key)
+        return _normalize_module_result(module_name, result)
+    if module_name == MODULE_PATTERN_VERIFY:
+        employee_result = (
+            (ctx.module_results or {}).get(MODULE_EMPLOYEE_NAMES)
+            or ModuleResult(status=ModuleStatus.SKIPPED)
+        )
+        return await _run_pattern(
+            module,
+            ctx.domain,
+            employee_names=_employee_names_from_findings(employee_result.findings or []),
+            enable_smtp=ctx.enable_smtp,
+            signal_pool=ctx.signal_pool,
+            budget=ctx.budget,
+            provider_detection=ctx.provider_detection,
+            mx_records=ctx.provider_mx_records,
+            pattern_run_state=ctx.pattern_run_state,
+            progress_callback=(
+                (lambda action: ctx.progress_callback(module_name, action))
+                if ctx.progress_callback is not None else None
+            ),
+        )
+    if module_name == MODULE_RIPE_STAT_ASN:
+        hackertarget = (ctx.module_results or {}).get(MODULE_HACKERTARGET)
+        infrastructure = (
+            (hackertarget.metadata or {}).get("infrastructure", {})
+            if hackertarget
+            else {}
+        )
+        ip_rows = infrastructure.get("ips", []) if isinstance(infrastructure, dict) else []
+        resolved_ips = [
+            str(row.get("ip"))
+            for row in ip_rows
+            if isinstance(row, dict) and row.get("ip")
+        ]
+        return await module.run(ctx.domain, resolved_ips=resolved_ips)
+    if module_name == MODULE_SHODAN_INTERNETDB:
+        hackertarget = (ctx.module_results or {}).get(MODULE_HACKERTARGET)
+        infrastructure = (
+            (hackertarget.metadata or {}).get("infrastructure", {})
+            if hackertarget
+            else {}
+        )
+        ip_rows = infrastructure.get("ips", []) if isinstance(infrastructure, dict) else []
+        resolved_ips = [
+            str(row.get("ip"))
+            for row in ip_rows
+            if isinstance(row, dict) and row.get("ip")
+        ]
+        if not resolved_ips:
+            return ModuleResult(
+                ModuleStatus.SKIPPED,
+                metadata={
+                    "domain": ctx.domain,
+                    "skip_reason": "no_resolved_ips",
+                    "infrastructure": {"ips": [], "asns": []},
+                },
+            )
+        records = await module.enrich(resolved_ips)
+        enriched_ips = [
+            {
+                "ip": ip,
+                "shodan_data": data,
+                "sources": ["shodan_internetdb"],
+            }
+            for ip, data in sorted(records.items())
+        ]
+        return ModuleResult(
+            ModuleStatus.SUCCESS if records else ModuleStatus.PARTIAL,
+            metadata={
+                "domain": ctx.domain,
+                "resolved_ips": len(resolved_ips),
+                "shodan_ips_enriched": len(records),
+                "infrastructure": {"ips": enriched_ips, "asns": []},
+            },
+        )
+    name, result = await _safe_phase12_run(
+        module_name,
+        module,
+        ctx.domain,
+        cc_max_records=ctx.cc_max_records,
+        cc_max_collections=ctx.cc_max_collections,
+        dork_lite_mode=ctx.dork_lite_mode,
+        aggressive=ctx.aggressive,
+        use_proxies=ctx.use_proxies,
+        proxy_fallback_ok=ctx.proxy_fallback_ok,
+        fetch=ctx.page_cache,
+        signal_pool=ctx.signal_pool,
+        budget=ctx.budget,
+        soft_timeout=soft_timeout,
+        with_subdomains=ctx.with_subdomains,
+        subdomain_deep=ctx.subdomain_deep,
+        enable_scraping=not ctx.subdomain_calibrate,
+        context_vertical=ctx.context_vertical,
+        scrape_session=ctx.stealth_session,
+        source_telemetry=ctx.subdomain_source_telemetry,
+        netlas_enabled=ctx.netlas_enabled,
+        whoisfreaks_enabled=ctx.whoisfreaks_enabled,
+        # The run's own early prefetch owns --refresh for dated hosts; refreshing
+        # here too would buy the same pages twice.
+        whoisfreaks_refresh=False,
+        no_whoisfreaks=ctx.no_whoisfreaks,
+        netlas_cert_fetch=(
+            (lambda: _netlas_cert_future(ctx))
+            if ctx.netlas_enabled and MODULE_NETLAS_CERT not in ctx.skip_modules
+            else None
+        ),
+        progress_callback=(
+            (lambda action: ctx.progress_callback(module_name, action))
+            if ctx.progress_callback is not None else None
+        ),
+    )
+    return _normalize_module_result(name, result)
+
+
+def _netlas_cert_future(ctx: WorkerContext) -> asyncio.Future[Any]:
+    """The run's ONE certificate fetch (F3), started on first use.
+
+    ``netlas_cert`` (emails, sister seeds) and ``subdomain_intel`` (SAN hosts)
+    both await this same future, so a harvest sends exactly one cert request
+    to Netlas' 3 req/min lane. Callers must ``asyncio.shield`` it so one
+    consumer's timeout never cancels the other's result.
+    """
+    future = ctx.netlas_state.get("certs")
+    if future is None:
+        from .company_discovery import _registrable_domain
+        from .netlas_client import fetch_certificates
+
+        future = asyncio.ensure_future(
+            fetch_certificates(
+                _registrable_domain(ctx.domain),
+                getattr(ctx.settings, "netlas_api_key", None),
+            )
+        )
+        ctx.netlas_state["certs"] = future
+    return future
+
+
+class _InlineSource:
+    """Placeholder instance for sources dispatched by name in
+    :func:`_run_module_instance` (they have no module class)."""
+
+
+def _get_module_instance(module_name: str, ctx: WorkerContext) -> Any:
+    overrides = ctx.module_overrides or {}
+    if module_name in overrides:
+        return overrides[module_name]
+    factories = {
+        MODULE_COMMONCRAWL: CommonCrawlEmailModule,
+        MODULE_WAYBACK_DOMAIN: WaybackDomainHarvestModule,
+        MODULE_CODE_CERT: CodeAndCertEmailModule,
+        MODULE_EMAIL_DORK: EmailSearchDorkModule,
+        MODULE_NPM_EMAIL: NpmEmailModule,
+        MODULE_PYPI_EMAIL: PyPIEmailModule,
+        MODULE_PUBLIC_SURFACE: PublicSurfaceSweeper,
+        MODULE_PUBLIC_FORGE: PublicForgeModule,
+        MODULE_PACKAGE_ECOSYSTEMS: PackageEcosystemsModule,
+        MODULE_SUBDOMAIN_SURFACE: SubdomainIntelModule,
+        MODULE_PGP_DOMAIN_EMAIL: PgpDomainEmailModule,
+        MODULE_GITHUB_ORG_MEMBERS: GitHubOrgMembersModule,
+        MODULE_GITHUB_DOMAIN_COMMITS: GitHubDomainCommitsModule,
+        MODULE_EMPLOYEE_NAMES: EmployeeNameDiscoveryModule,
+        MODULE_PATTERN_VERIFY: PatternAndVerifyModule,
+        MODULE_WORDPRESS_REST: WordPressRestModule,
+        MODULE_SYNDICATION_FEED_SWEEPER: SyndicationFeedSweeper,
+        MODULE_HACKERTARGET: HackerTargetHostsModule,
+        MODULE_RIPE_STAT_ASN: RIPEStatASNModule,
+        MODULE_SHODAN_INTERNETDB: ShodanInternetDBModule,
+        MODULE_NETLAS_WHOIS: _InlineSource,
+        MODULE_WHOISFREAKS_HISTORY: _InlineSource,
+        MODULE_OWN_INDEX: _InlineSource,
+        MODULE_NETLAS_CERT: _InlineSource,
+        MODULE_NETLAS_RESPONSES: _InlineSource,
+    }
+    
+    from ..modules.email_identity_enrichment import EmailIdentityEnrichmentModule
+    from ..modules.name_to_github_profile import NameToGitHubProfileModule
+    from ..modules.person_email_pivot import PersonEmailPivotModule
+    from ..modules.persona_email_pivot import PersonaEmailPivotModule
+    from ..modules.security_txt import SecurityTxtModule
+    
+    factories["security_txt"] = SecurityTxtModule
+    factories["name_to_github_profile"] = NameToGitHubProfileModule
+    factories[MODULE_PERSON_EMAIL_PIVOT] = PersonEmailPivotModule
+    factories[MODULE_PERSONA_EMAIL_PIVOT] = PersonaEmailPivotModule
+    factories[MODULE_EMAIL_IDENTITY_ENRICHMENT] = EmailIdentityEnrichmentModule
+
+    try:
+        return factories[module_name]()
+    except KeyError as exc:
+        raise ValueError(f"unknown harvest module: {module_name}") from exc
+
+
+async def _progress_loop(ctx: WorkerContext) -> None:
+    try:
+        while not ctx.budget.is_expired():
+            stats = ctx.scheduler.stats
+            budget = ctx.budget.stats
+            logger.debug(
+                "Queue: %d items | Budget: %.0fs remaining | Track1: %s",
+                stats["queue_size"],
+                budget["remaining_seconds"],
+                budget["track1_status"],
+            )
+            await asyncio.sleep(5.0)
+    except asyncio.CancelledError:
+        raise
+
+
+async def _read_homepage_for_router(ctx: WorkerContext) -> str:
+    try:
+        response = await asyncio.wait_for(
+            ctx.page_cache.get(f"https://{ctx.domain}/"),
+            timeout=min(5.0, max(0.05, ctx.budget.remaining())),
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    return getattr(response, "text", "") or ""
+
+
+def _write_to_signal_pool(result: WorkResult, signal_pool: AsyncSignalPool) -> None:
+    source = result.item.module_name or result.item.source or result.item.kind
+    for finding in result.findings or []:
+        # A finding may name its own signal source (F2 WHOIS → "whois").
+        _emit_finding(signal_pool, str(finding.get("signal_source") or source), finding, "")
+
+
+def _emit_finding(
+    signal_pool: AsyncSignalPool,
+    source: str,
+    finding: dict[str, Any],
+    domain: str,
+) -> None:
+    meta = finding.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    email = meta.get("email") or finding.get("email")
+    confidence = meta.get("confidence_score") or meta.get("confidence") or 0.5
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        confidence_value = 0.5
+    if isinstance(email, str) and "@" in email:
+        finding_name = meta.get("name") or meta.get("person_name")
+        signal_pool.emit_email(
+            email,
+            source=source,
+            confidence=confidence_value,
+            domain=email.rsplit("@", 1)[-1].lower(),
+            name=finding_name,
+            is_role=bool(meta.get("is_role")),
+            original_email=meta.get("original_email") or email,
+        )
+        if not finding_name:
+            from ..modules.person_email_pivot import derive_name_from_email
+
+            finding_name = derive_name_from_email(email)
+            if finding_name:
+                signal_pool.emit_name(
+                    finding_name,
+                    source,
+                    confidence=max(0.35, confidence_value * 0.75),
+                    domain=domain or email.rsplit("@", 1)[-1].lower(),
+                    email=email,
+                    derived_from_email=True,
+                )
+    name = meta.get("name") or meta.get("person_name") or finding.get("name")
+    if isinstance(name, str) and name.strip():
+        signal_pool.emit_name(
+            name,
+            source=source,
+            confidence=confidence_value,
+            domain=domain or meta.get("domain"),
+            email=email if isinstance(email, str) else None,
+            title_or_role=meta.get("title_or_role"),
+        )
+
+
+def _emit_module_complete(
+    ctx: WorkerContext,
+    module_name: str,
+    result: ModuleResult,
+) -> None:
+    status_value = result.status.value if hasattr(result.status, "value") else str(result.status)
+    errors = list(result.errors or [])
+    _meta = getattr(result, "metadata", None) or {}
+    if not errors and isinstance(_meta, dict) and _meta.get("skip_note"):
+        # A deliberate skip (e.g. "skipped: own index had results") is reported to
+        # the live view / event stream, but is not a run error.
+        errors = [str(_meta["skip_note"])]
+    # 0.12.7: persist a per-source health row so the `mailaccess
+    # doctor` command can surface success rate + average duration
+    # over the last 24h.  Done BEFORE invoking the callback so a
+    # misbehaving callback never silently blocks the health
+    # record from being written.
+    try:
+        from .platform_health import get_health_db
+
+        health_db = get_health_db()
+        duration = getattr(result, "duration_seconds", None) or 0.0
+        if not duration:
+            meta = getattr(result, "metadata", {}) or {}
+            if isinstance(meta, dict):
+                duration = float(
+                    meta.get("duration_seconds")
+                    or meta.get("elapsed_seconds")
+                    or 0.0
+                )
+        health_db.record_module_run(
+            module_name=module_name,
+            domain=ctx.domain if hasattr(ctx, "domain") else None,
+            status=status_value,
+            duration_seconds=duration if duration else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("platform_health: record_module_run failed: %s", exc)
+    if ctx.on_module_complete is None:
+        return
+    try:
+        ctx.on_module_complete(module_name, status_value, errors)
+    except TypeError:
+        with contextlib.suppress(Exception):
+            ctx.on_module_complete(module_name, status_value)
+    except Exception:  # noqa: BLE001
+        logger.debug("on_module_complete(%s) raised", module_name, exc_info=True)
+
+
+async def _grade_leads_and_capture(
+    domain: str,
+    unique_emails: list[Any],
+    module_results: dict[str, ModuleResult],
+) -> None:
+    """Phase 3C/3D + 4A — grade leads (non-SMTP) and capture calibration features.
+
+    Thin adapter over the orchestrator's ``_apply_deliverability_grade`` so the
+    live adaptive harvest path populates the deliverability grade/score fields and
+    writes the Phase-4A feature snapshots. Extracts the domain catch-all verdict
+    from ``pattern_and_verify`` metadata. Fully guarded — a grading failure leaves
+    leads ungraded, never breaks
+    the harvest, and never changes yield (additive fields only).
+    """
+    try:
+        from .domain_harvest_orchestrator import _apply_deliverability_grade
+
+        catchall: bool | None = None
+        pv = module_results.get(MODULE_PATTERN_VERIFY)
+        if pv is not None and isinstance(pv.metadata, dict) and "is_catchall" in pv.metadata:
+            catchall = pv.metadata.get("is_catchall")
+        await _apply_deliverability_grade(
+            unique_emails, domain, catchall_detected=catchall
+        )
+    except Exception:
+        logger.debug("deliverability grading/capture unavailable for %s", domain, exc_info=True)
+
+
+async def _enrich_leads_waterfall(
+    domain: str, unique_emails: list[Any]
+) -> dict[str, Any] | None:
+    """Phase 7A/7B — fill missing person fields via the enrichment waterfall.
+
+    Runs BEFORE deliverability grading (grading reads the person/company fields
+    enrichment may fill) and AFTER aggregation (so we know which fields are
+    actually missing). Governed by the run's active product mode: only
+    mode-allowed connectors run, and PDL (data-broker) is gated to
+    security-investigation. Enrichment only appends evidence, so person
+    attribution is re-run to fold the new evidence through the 1E resolver —
+    native evidenced claims still win, enrichment only fills gaps. Fully guarded:
+    a failure leaves leads exactly as aggregated (no yield/parity change).
+    """
+    try:
+        from .domain_harvest_orchestrator import _apply_person_attribution
+        from .enrichment_waterfall import enrich_leads
+        from .product_mode import get_active_mode
+
+        summary = await enrich_leads(unique_emails, mode=get_active_mode())
+        if summary.get("enriched"):
+            _apply_person_attribution(unique_emails)
+        return summary
+    except Exception:
+        logger.debug("enrichment waterfall unavailable for %s", domain, exc_info=True)
+        return None
+
+
+async def _compute_technographics(ctx: WorkerContext, cache: Any) -> dict[str, Any] | None:
+    """Phase 5D — tag the domain's tech stack from ALREADY-fetched bytes.
+
+    Mail provider comes from the MX the harvest already resolved
+    (``ctx.provider_detection``); CMS/analytics/ecommerce/framework tags come from
+    the homepage HTML already in the shared fetch cache, read via ``cache.peek``
+    (cache-only — a miss returns None, never a new request). Introduces zero
+    network I/O. Guarded → None on any failure; skipped for injected-module paths.
+    """
+    if ctx.module_overrides:
+        return None
+    try:
+        from .context_router import _homepage_url_for
+        from .technographics import detect
+
+        html: str | None = None
+        if cache is not None and hasattr(cache, "peek"):
+            resp = await cache.peek(_homepage_url_for(ctx.domain))
+            if resp is not None:
+                html = getattr(resp, "text", None)
+        provider = None
+        detection = getattr(ctx, "provider_detection", None)
+        if detection is not None:
+            provider = getattr(detection, "provider", None)
+        if html is None and not provider:
+            return None
+        return detect(html=html, mail_provider=provider).as_dict()
+    except Exception:
+        logger.debug("technographic tagging unavailable for %s", ctx.domain, exc_info=True)
+        return None
+
+
+async def _attach_breach_enrichment(
+    unique_emails: list[Any],
+    module_results: dict[str, ModuleResult] | None = None,
+    ctx: WorkerContext | None = None,
+) -> None:
+    """Phase 5 — run breach aggregation on confirmed emails only.
+
+    Post-confirmation enrichment: only SMTP-/provider-verified mailboxes
+    are probed; unverified pattern candidates are never sent to the breach
+    sources.  Failures are swallowed so enrichment can never stall or fail
+    the harvest tail.  Each confirmed email's ``breach_enrichment`` field is
+    populated with privacy-safe finding dicts.
+    """
+    try:
+        from ..modules.breach_aggregator import (
+            NO_SOURCE_MESSAGE,
+            SOURCE_NAMES,
+            configured_sources,
+            enrich_confirmed_emails,
+        )
+
+        if not configured_sources(settings):
+            if module_results is not None:
+                result = ModuleResult(
+                    status=ModuleStatus.SKIPPED,
+                    errors=[NO_SOURCE_MESSAGE],
+                    metadata={"skip_reason": "no_breach_source"},
+                )
+                module_results["breach_aggregator"] = result
+                if ctx is not None:
+                    _emit_module_complete(ctx, "breach_aggregator", result)
+            return
+
+        telemetry_by_email: dict[str, dict[str, dict[str, Any]]] = {}
+        enrichment = await enrich_confirmed_emails(
+            unique_emails,
+            settings,
+            telemetry_by_email=telemetry_by_email,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("breach enrichment tail failed: %s", exc)
+        if module_results is not None:
+            module_results["breach_aggregator"] = ModuleResult(
+                status=ModuleStatus.FAILED,
+                errors=[f"breach_aggregator: {exc}"],
+                metadata={"sources": {}},
+            )
+        return
+
+    by_email = {getattr(e, "email", None): e for e in unique_emails}
+    for address, findings in enrichment.items():
+        entry = by_email.get(address)
+        if entry is not None:
+            entry.breach_enrichment = [bf.to_finding() for bf in findings]
+
+    if module_results is None:
+        return
+
+    source_rows: dict[str, dict[str, Any]] = {}
+    for source in SOURCE_NAMES:
+        rows = [
+            per_email.get(source, {})
+            for per_email in telemetry_by_email.values()
+            if isinstance(per_email.get(source), dict)
+        ]
+        statuses = [str(row.get("status", "not_run")) for row in rows]
+        attempted = [status for status in statuses if status not in {"skipped", "not_run"}]
+        if not rows or not attempted:
+            status = "skipped"
+        elif "rate_limited" in attempted:
+            status = "rate_limited"
+        elif "success" in attempted:
+            status = "success"
+        else:
+            status = "error"
+        source_rows[source] = {
+            "status": status,
+            "checked": sum(int(row.get("checked") or 0) for row in rows),
+            "hits": sum(int(row.get("hits") or 0) for row in rows),
+            "http_status": next(
+                (row.get("http_status") for row in rows if row.get("http_status") is not None),
+                None,
+            ),
+            "duration_seconds": round(
+                sum(float(row.get("duration_seconds") or 0.0) for row in rows),
+                3,
+            ),
+            "error": next(
+                (row.get("error") for row in rows if row.get("error")),
+                None,
+            ),
+        }
+
+    total_hits = sum(row["hits"] for row in source_rows.values())
+    attempted_rows = [
+        row for row in source_rows.values() if row["status"] not in {"skipped", "not_run"}
+    ]
+    if not attempted_rows:
+        status = ModuleStatus.SKIPPED
+    elif any(row["status"] == "rate_limited" for row in attempted_rows):
+        status = ModuleStatus.PARTIAL
+    elif total_hits:
+        status = ModuleStatus.SUCCESS
+    elif all(row["status"] == "success" for row in attempted_rows):
+        status = ModuleStatus.SUCCESS_EMPTY
+    elif all(row["status"] == "error" for row in attempted_rows):
+        status = ModuleStatus.FAILED
+    else:
+        status = ModuleStatus.PARTIAL
+
+    breach_findings = [
+        finding
+        for findings in enrichment.values()
+        for finding in findings
+    ]
+    metadata = {
+        "sources": source_rows,
+        "total_breach_records": len(breach_findings),
+        "sources_with_password_data": sum(
+            1
+            for finding in breach_findings
+            if finding.has_plaintext_password or finding.has_hash
+        ),
+        "source_types": sorted({finding.source_type for finding in breach_findings}),
+    }
+    result = ModuleResult(
+        status=status,
+        findings=[finding.to_finding() for finding in breach_findings],
+        metadata=metadata,
+    )
+    module_results["breach_aggregator"] = result
+    if ctx is not None:
+        _emit_module_complete(ctx, "breach_aggregator", result)
+
+
+def _employee_name_count(module_results: dict[str, ModuleResult]) -> int:
+    result = module_results.get(MODULE_EMPLOYEE_NAMES)
+    if result is None:
+        return 0
+    return len(result.findings or [])
+
+
+def _record_work_failure(ctx: WorkerContext, work: WorkResult) -> None:
+    """Surface worker exceptions in module results, health, and live progress."""
+    module_name = work.item.module_name
+    if work.success or not module_name:
+        return
+    result = ModuleResult(
+        status=ModuleStatus.FAILED,
+        errors=list(work.errors or ["module worker failed"]),
+        metadata={
+            "domain": ctx.domain,
+            "duration_seconds": round(float(work.duration_seconds or 0.0), 3),
+        },
+    )
+    _record_module_result(ctx, module_name, result)
+    _emit_module_complete(ctx, module_name, result)
+    logger.error("Harvest module %s failed: %s", module_name, "; ".join(result.errors))
+
+
+def _prune_done(tasks: set[asyncio.Task[None]]) -> None:
+    done = {task for task in tasks if task.done()}
+    for task in done:
+        tasks.remove(task)
+        if task.cancelled():
+            logger.warning("Harvest task was cancelled before completion")
+            continue
+        error = task.exception()
+        if error is not None:
+            logger.error("Harvest task failed: %r", error)
+
+
+__all__ = [
+    "WorkerContext",
+    "run_adaptive_harvest",
+    "_execute_item",
+    "_fetch_and_extract",
+    "_progress_loop",
+    "_run_module",
+    "_track1_loop",
+    "_track2_loop",
+]
+
+
+def collect_harvest_ips(module_results: dict) -> list[str]:
+    """Existing infrastructure first, then distinct resolved subdomain IPs."""
+    from .ipgeo_client import public_ips
+
+    raw = []
+    for name, result in module_results.items():
+        if name == "ip_intel":
+            continue
+        meta = result.metadata or {}
+        infra = meta.get("infrastructure") or {}
+        raw.extend(row.get("ip") for row in infra.get("ips", []) if isinstance(row, dict))
+    for result in module_results.values():
+        meta = result.metadata or {}
+        for subdomain in [*(meta.get("subdomains", []) or []), *(result.findings or [])]:
+            if isinstance(subdomain, dict):
+                raw.extend(subdomain.get("resolved_ips") or [])
+    return public_ips(raw)[: max(0, settings.ipgeo_harvest_ip_cap)]
+
+
+async def enrich_harvest_ip_intel(
+    module_results: dict, *, no_ipgeo: bool = False, refresh: bool = False
+) -> None:
+    from .enrichment_store import enrich_ips
+
+    ips = collect_harvest_ips(module_results)
+    records = await enrich_ips(ips, no_ipgeo=no_ipgeo, refresh=refresh)
+    module_results.pop("ip_intel", None)
+    if records:
+        module_results["ip_intel"] = ModuleResult(
+            ModuleStatus.SUCCESS,
+            metadata={
+                "infrastructure": {
+                    "ips": [{**data, "sources": ["ipgeolocation.io"]} for data in records.values()],
+                    "asns": [],
+                }
+            },
+        )

@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+_INFOSTEALER_MODULES = frozenset({"hudson_rock"})
+_BREACH_MODULES = frozenset(
+    {"hibp", "breachdirectory", "breach_deep", "xposedornot", "intelx_lookup",
+     "breach_aggregator"}
+)
+_USERNAME_ENUM_MODULES = frozenset(
+    {
+        "username_platforms",
+        "github_code_search",
+        "pastebin_search",
+        "fediverse_discovery",
+        "gravatar_lookup",
+        "account_discovery",
+        "username_pivot",
+    }
+)
+_DOMAIN_INTEL_MODULES = frozenset(
+    {"domain_harvester", "domain_intel", "whois_lookup", "dns_lookup", "shodan"}
+)
+_SOCIAL_MODULES = frozenset(
+    {
+        "gravatar",
+        "social_links",
+        "google_account_intel",
+        "social",
+        "twitter_profile",
+        "linkedin_serp",
+        "marketplace_profile",
+        "email_discovery",
+    }
+)
+_POST_PRIMARY_ONLY = frozenset(
+    {
+        "username_pivot",
+        "phone_intel",
+        "email_discovery",
+        "alternate_email",
+        "twitter_profile",
+        "linkedin_serp",
+        "marketplace_profile",
+        "domain_cluster",
+        "breach_aggregator",
+        "ip_intel",
+        "whoisfreaks_intel",
+    }
+)
+
+# T1 (Output-Trust final): SPECULATIVE enumerators — they probe a guess derived
+# from the bare email localpart (not confirmed evidence) across a large corpus.
+# The PrimaryPhase runs these AFTER the real-signal / evidence modules so a heavy
+# localpart sweep can never starve the sources that actually confirm identity
+# (github/PGP/keybase/gravatar/…). Their hits are also gated to unverified (RC1).
+_SPECULATIVE_ENUMERATION = frozenset(
+    {
+        "username_platforms",
+        "account_discovery",
+    }
+)
+
+_WEIGHT_INFOSTEALER = 20
+_WEIGHT_BREACH = 15
+_WEIGHT_SOCIAL = 5
+_WEIGHT_META = 2
+
+_MODULE_WEIGHT_OVERRIDES: dict[str, int] = {
+    "ip_intel": 0,
+    "whoisfreaks_intel": 0,
+    "breach_deep": 18,
+    "domain_harvester": 5,
+    "domain_intel": 5,
+    "whois_lookup": 5,
+    "dns_lookup": 5,
+    "shodan": 5,
+    # F6 — public email footprint (where the address appears online). A
+    # social-tier exposure weight; capped below so many response mentions of
+    # one address can't dominate the score.
+    "netlas_email_footprint": 5,
+    # F7 - org posture is context around the employer, not the person, so it
+    # contributes only lightly (and only its CVE findings), hard-capped below.
+    "netlas_org_surface": 2,
+}
+_CONFIDENCE_MULTIPLIER: dict[str, float] = {
+    "high": 1.0,
+    "medium": 0.5,
+    "low": 0.2,
+    "none": 0.0,
+}
+_MODULE_CAP: dict[str, int] = {
+    "username_platforms": 25,
+    "account_discovery": 15,
+    "username_pivot": 10,
+    "email_discovery": 10,
+    "social": 10,
+    "github_code_search": 10,
+    "pastebin_search": 8,
+    "gravatar_lookup": 5,
+    "fediverse_discovery": 15,
+    "domain_harvester": 25,
+    "social_links": 5,
+    "hudson_rock": 40,
+    "breach_deep": 50,
+    "hibp": 45,
+    "breachdirectory": 40,
+    "xposedornot": 45,
+    "intelx_lookup": 50,
+    "breach_aggregator": 50,
+    "netlas_email_footprint": 20,
+    "netlas_org_surface": 10,
+    "whoisfreaks_intel": 5,
+}
+_MODULE_DEFAULT_TIMEOUTS: dict[str, int] = {
+    "breach_deep": 90,
+    "github_commits": 90,
+    # F6 — Netlas call latency swings 0.4s→>10s under load and the certs lookup
+    # alone can take ~19s, so the 30s global cap truncated all three lookups. The
+    # internal deadline (``netlas_footprint_deadline_seconds``) sits 5s below this.
+    "netlas_email_footprint": 60,
+    "whoisfreaks_intel": 60,
+}
+_MODULE_TIMEOUT_FLOORS: dict[str, int] = {
+    "account_discovery": 180,
+    # UC4: the pivot ends inside username_pivot_budget_seconds (45 s); this is only
+    # the safety net, and the sink keeps its hits if it ever fires.
+    "username_pivot": 60,
+    "username_platforms": 180,
+}
+_OPT_IN_FLAG_BY_MODULE: dict[str, str] = {
+    "breach_deep": "enable_breach_deep",
+    "email_discovery": "enable_email_discovery",
+    "press_intel": "enable_press_intel",
+    "username_platforms": "enable_username_platforms",
+}
+
+
+def module_weight(module_name: str) -> int:
+    if module_name in _MODULE_WEIGHT_OVERRIDES:
+        return _MODULE_WEIGHT_OVERRIDES[module_name]
+    if module_name in _INFOSTEALER_MODULES:
+        return _WEIGHT_INFOSTEALER
+    if module_name in _BREACH_MODULES:
+        return _WEIGHT_BREACH
+    if module_name in _USERNAME_ENUM_MODULES:
+        return _WEIGHT_SOCIAL
+    if module_name in _SOCIAL_MODULES:
+        return _WEIGHT_SOCIAL
+    if module_name in _DOMAIN_INTEL_MODULES:
+        return _WEIGHT_META
+    return _WEIGHT_META
